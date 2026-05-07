@@ -64,7 +64,6 @@ bool LFM2::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std::f
         return false;
     }
     if (!input.messages.empty()) { // already a formated messages, usually from REST API
-        //templated_text = this->apply_chat_template(input.messages);
         templated_text = this->apply_chat_template(input.messages, input.tools);
     }
     else if (!input.prompt.empty()) { // a pure text, usually from the cli
@@ -327,7 +326,6 @@ bool LFM2_5_TK::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, s
         return false;
     }
     if (!input.messages.empty()) { // already a formated messages, usually from REST API
-        //templated_text = this->apply_chat_template(input.messages);
         templated_text = this->apply_chat_template(input.messages, input.tools);
     }
     else if (!input.prompt.empty()) { // a pure text, usually from the cli

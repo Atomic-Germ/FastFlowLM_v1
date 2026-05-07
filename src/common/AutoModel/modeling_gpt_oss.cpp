@@ -52,7 +52,6 @@ std::string GPT_OSS::apply_chat_template(nlohmann::ordered_json& messages, nlohm
 
     return this->chat_tmpl->apply(inputs);
 }
-json tools;
 bool GPT_OSS::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std::function<bool()> is_cancelled)
 {
     // preprocess
@@ -63,9 +62,8 @@ bool GPT_OSS::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std
         return false;
     }
     if (!input.messages.empty()) { // already a formated messages, usually from REST API
-        tools = input.tools;
+        this->tools = input.tools;
         templated_text = this->apply_chat_template(input.messages);
-        //templated_text = this->apply_chat_template(input.messages, input.tools);
     }
     else if (!input.prompt.empty()) { // a pure text, usually from the cli
         nlohmann::ordered_json messages;

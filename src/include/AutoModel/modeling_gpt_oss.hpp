@@ -28,6 +28,7 @@ private:
     };
     ToolGrammarState current_state = STATE_EXPECT_TO_FUNCTIONS;
     std::string accumulated_text;
+    json tools;
     void reset_tool_grammar_state() {
         current_state = STATE_EXPECT_TO_FUNCTIONS;
         accumulated_text.clear();

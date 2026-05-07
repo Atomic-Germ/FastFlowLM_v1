@@ -557,8 +557,46 @@ void DeepSeek_r1_0528_8b::setup_tokenizer(std::string model_path) {
 std::string DeepSeek_r1_0528_8b::apply_chat_template(nlohmann::ordered_json& messages, nlohmann::ordered_json tools) {
     minja::chat_template_inputs inputs;
     inputs.add_generation_prompt = true;
-    inputs.messages = messages;
     inputs.extra_context = this->extra_context;
+
+    if (!tools.empty()) {
+        // The DeepSeek-R1-0528 template has no {%- if tools %} section, so tool
+        // definitions must be injected manually as a system message.
+        // The model's tokenizer vocab uses <tool_call>/<think> tokens (same as
+        // Qwen3), so we use the same system-message format as Qwen3-Instruct.
+        std::string tool_system =
+            "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+        for (auto& tool : tools) {
+            tool_system += "\n" + tool.dump();
+        }
+        tool_system +=
+            "\n</tools>\n\n"
+            "For each function call, return a json object with function name and arguments "
+            "within <tool_call></tool_call> XML tags:\n"
+            "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
+
+        // Build modified messages with the tool-definition system message first.
+        nlohmann::ordered_json modified_messages = nlohmann::ordered_json::array();
+        if (!messages.empty() && messages[0]["role"] == "system") {
+            // Prepend tool definitions to an existing system message.
+            std::string existing = messages[0]["content"].is_string()
+                ? messages[0]["content"].get<std::string>() : "";
+            nlohmann::ordered_json sys = messages[0];
+            sys["content"] = tool_system + (existing.empty() ? "" : "\n\n" + existing);
+            modified_messages.push_back(sys);
+            for (size_t i = 1; i < messages.size(); ++i)
+                modified_messages.push_back(messages[i]);
+        } else {
+            modified_messages.push_back({{"role", "system"}, {"content", tool_system}});
+            for (auto& msg : messages)
+                modified_messages.push_back(msg);
+        }
+        inputs.messages = modified_messages;
+    } else {
+        inputs.messages = messages;
+    }
+
     return this->chat_tmpl->apply(inputs);
 }
 
@@ -571,7 +609,7 @@ bool DeepSeek_r1_0528_8b::insert(chat_meta_info_t& meta_info, lm_uniform_input_t
         return false;
     }
     if (!input.messages.empty()) { // already a formated messages, usually from REST API
-        templated_text = this->apply_chat_template(input.messages);
+        templated_text = this->apply_chat_template(input.messages, input.tools);
     }
     else if (!input.prompt.empty()) { // a pure text, usually from the cli
         nlohmann::ordered_json messages;
@@ -606,71 +644,190 @@ std::string DeepSeek_r1_0528_8b::generate_with_prompt(chat_meta_info_t& meta_inf
 NonStreamResult DeepSeek_r1_0528_8b::parse_nstream_content(const std::string response_text) {
     NonStreamResult result;
 
-    std::string content, reasoning_content;
-
-    std::string think_start_tag = "<think>";
-    std::string think_end_tag = "</think>";
+    const std::string think_start_tag = "<think>";
+    const std::string think_end_tag   = "</think>";
+    // This model generates tool calls as a ```json code block containing
+    // {"name": "...", "arguments": {...}} - matching the system message we inject.
+    const std::string code_start_tag  = "```json";
+    const std::string code_end_tag    = "```";
 
     size_t think_start_pos = response_text.find(think_start_tag);
-    size_t think_end_pos = response_text.find(think_end_tag);
+    size_t think_end_pos   = response_text.find(think_end_tag);
 
+    bool is_reasoning = !(think_start_pos == std::string::npos || think_end_pos == std::string::npos);
 
-    think_start_pos += think_start_tag.length();
-    std::string reasoning_str = response_text.substr(think_start_pos, think_end_pos - think_start_pos);
-    result.reasoning_content = reasoning_str;
+    if (is_reasoning) {
+        size_t body_start = think_start_pos + think_start_tag.length();
+        result.reasoning_content = response_text.substr(body_start, think_end_pos - body_start);
+    }
 
-    std::string content_str = response_text.substr(think_end_pos + think_end_tag.length());
-    result.content = content_str;
+    // Look for ```json block containing {"name": ..., "arguments": ...}
+    size_t code_start_pos = response_text.find(code_start_tag);
+    if (code_start_pos != std::string::npos) {
+        size_t json_start = code_start_pos + code_start_tag.length();
+        // skip newline after ```json
+        if (json_start < response_text.size() && response_text[json_start] == '\n')
+            json_start++;
+        // find the closing ``` (must be on its own - search after json_start)
+        size_t code_end_pos = response_text.find(code_end_tag, json_start);
+        if (code_end_pos != std::string::npos) {
+            std::string json_str = response_text.substr(json_start, code_end_pos - json_start);
+            // trim trailing whitespace
+            while (!json_str.empty() && (json_str.back() == '\n' || json_str.back() == '\r' || json_str.back() == ' '))
+                json_str.pop_back();
+            try {
+                auto j = nlohmann::json::parse(json_str);
+                if (j.contains("name") && j.contains("arguments")) {
+                    result.tool_name = j["name"].get<std::string>();
+                    result.tool_args = j["arguments"].is_string()
+                        ? j["arguments"].get<std::string>()
+                        : j["arguments"].dump();
+                    return result;
+                }
+            } catch (...) {}
+        }
+    }
 
+    // No tool call found - return as content
+    size_t content_start = (think_end_pos != std::string::npos)
+        ? think_end_pos + think_end_tag.length()
+        : 0;
+    result.content = response_text.substr(content_start);
     return result;
 }
 
 
 StreamResult DeepSeek_r1_0528_8b::parse_stream_content(const std::string content) {
-    const std::string MARKER_THINK_START = "<think>";
-    const std::string MARKER_THINK_END = "</think>";
+    // This model outputs tool calls as:
+    //   ```json\n{"name":"...","arguments":{...}}\n```
+    // We detect that code block, parse it, and emit TOOL_DONE.
+    // Outside of that, <think>/<think> is handled for reasoning.
+    const std::string THINK_START = "<think>";
+    const std::string THINK_END   = "</think>";
+    const std::string CODE_START  = "```json";
+    const std::string CODE_END    = "```";
 
     StreamResult result;
     buffer_ += content;
 
     while (true) {
+        // ── Inside a buffered tool call code block ──────────────────────────
+        if (is_in_tool_block_) {
+            size_t end_pos = buffer_.find(CODE_END);
+            if (end_pos != std::string::npos) {
+                tool_name_ += buffer_.substr(0, end_pos);
+                buffer_ = buffer_.substr(end_pos + CODE_END.length());
+                is_in_tool_block_ = false;
+                // trim trailing whitespace from accumulated JSON
+                while (!tool_name_.empty() && (tool_name_.back() == '\n' || tool_name_.back() == '\r' || tool_name_.back() == ' '))
+                    tool_name_.pop_back();
+                try {
+                    auto j = nlohmann::json::parse(tool_name_);
+                    if (j.contains("name") && j.contains("arguments")) {
+                        result.type = StreamEventType::TOOL_DONE;
+                        result.tool_id = "call_" + std::to_string(std::time(nullptr));
+                        result.tool_name = j["name"].get<std::string>();
+                        result.tool_args_str = j["arguments"].is_string()
+                            ? j["arguments"].get<std::string>()
+                            : j["arguments"].dump();
+                    } else {
+                        // Not a tool call JSON - emit as plain content
+                        result.type = StreamEventType::CONTENT;
+                        result.content = CODE_START + "\n" + tool_name_ + "\n" + CODE_END;
+                    }
+                } catch (...) {
+                    result.type = StreamEventType::CONTENT;
+                    result.content = CODE_START + "\n" + tool_name_ + "\n" + CODE_END;
+                }
+                return result;
+            } else {
+                tool_name_ += buffer_;
+                buffer_.clear();
+                result.type = StreamEventType::WAITING;
+                return result;
+            }
+        }
+
+        // ── CONTENT mode: look for ```json tool call start or <think> ────────
         if (current_mode_ == StreamEventType::CONTENT) {
-            // Check for the start of a thought block
-            size_t pos = buffer_.find(MARKER_THINK_START);
+            size_t code_pos  = buffer_.find(CODE_START);
+            size_t think_pos = buffer_.find(THINK_START);
 
-            if (pos != std::string::npos) {
-                // Emit content before the tag
-                result.content += buffer_.substr(0, pos);
-                result.type = StreamEventType::CONTENT;
-
-                // Remove "<think>\n" and switch mode
-                buffer_ = buffer_.substr(pos + MARKER_THINK_START.length());
+            size_t first = std::min(code_pos, think_pos);
+            if (first != std::string::npos) {
+                if (first > 0) {
+                    // Emit content that precedes the marker, but hold back
+                    // any trailing bytes that could be a partial marker prefix.
+                    size_t safe_end = first;
+                    for (size_t len = std::min(CODE_START.length() - 1, first); len > 0; --len) {
+                        if (buffer_.substr(first - len, len) == CODE_START.substr(0, len) ||
+                            buffer_.substr(first - len, len) == THINK_START.substr(0, len)) {
+                            safe_end = first - len;
+                            break;
+                        }
+                    }
+                    if (safe_end == 0) break; // nothing safe to emit yet
+                    result.content = buffer_.substr(0, safe_end);
+                    result.type = StreamEventType::CONTENT;
+                    buffer_ = buffer_.substr(safe_end);
+                    return result;
+                }
+                if (code_pos == 0) {
+                    is_in_tool_block_ = true;
+                    tool_name_.clear();
+                    buffer_ = buffer_.substr(CODE_START.length());
+                    if (!buffer_.empty() && buffer_[0] == '\n')
+                        buffer_ = buffer_.substr(1);
+                    result.type = StreamEventType::WAITING;
+                    return result;
+                }
+                // think_pos == 0
+                buffer_ = buffer_.substr(THINK_START.length());
                 current_mode_ = StreamEventType::REASONING;
                 continue;
             }
         }
-        else if (current_mode_ == StreamEventType::REASONING) {
-            // Check for the end of a thought block
-            size_t pos = buffer_.find(MARKER_THINK_END);
 
-            if (pos != std::string::npos) {
-                // Emit content before the tag
-                result.content += buffer_.substr(0, pos);
-                result.type = StreamEventType::REASONING;
-
-                // Remove "</think>\n" and switch mode
-                buffer_ = buffer_.substr(pos + MARKER_THINK_END.length());
+        // ── REASONING mode: look for </think> ───────────────────────────────
+        if (current_mode_ == StreamEventType::REASONING) {
+            size_t end_pos = buffer_.find(THINK_END);
+            if (end_pos != std::string::npos) {
+                if (end_pos > 0) {
+                    result.content = buffer_.substr(0, end_pos);
+                    result.type = StreamEventType::REASONING;
+                    buffer_ = buffer_.substr(end_pos);
+                    return result;
+                }
+                buffer_ = buffer_.substr(THINK_END.length());
                 current_mode_ = StreamEventType::CONTENT;
                 continue;
             }
         }
 
-        // Flush remaining buffer
-        result.content += buffer_;
-        result.type = current_mode_;
-        buffer_.clear();
+        // ── No marker found: emit what is safely emittable ───────────────────
+        if (!buffer_.empty()) {
+            // Hold back trailing bytes that could be the start of a marker
+            std::string candidates[] = {CODE_START, THINK_START, THINK_END};
+            size_t hold = 0;
+            for (auto& m : candidates) {
+                for (size_t len = std::min(m.length() - 1, buffer_.length()); len > 0; --len) {
+                    if (buffer_.substr(buffer_.length() - len) == m.substr(0, len)) {
+                        hold = std::max(hold, len);
+                        break;
+                    }
+                }
+            }
+            size_t emit_len = buffer_.length() - hold;
+            if (emit_len > 0) {
+                result.content = buffer_.substr(0, emit_len);
+                result.type = current_mode_;
+                buffer_ = buffer_.substr(emit_len);
+                return result;
+            }
+        }
         break;
     }
 
+    result.type = current_mode_;
     return result;
 }
