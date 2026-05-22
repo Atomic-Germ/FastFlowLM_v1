@@ -111,6 +111,29 @@ private:
         std::pair<uint32_t*, size_t> data = this->ctrl_seq->dump();
         assert(data.first != nullptr);
         assert(data.second > 0);
+
+        // ── Instruction-buffer capture (set FF_DUMP_INSTR_PATH to enable) ──
+        // Writes the raw DPU transaction buffer (uint32_t sequence) to disk so
+        // that open-npu2/tools/txn.py can disassemble it.  Each unique sequence
+        // version gets its own file: <dir>/<kernel_name>_v<N>.bin
+        {
+            const char* dump_env = std::getenv("FF_DUMP_INSTR_PATH");
+            if (dump_env) {
+                std::string dump_dir(dump_env);
+                std::string fname = dump_dir + "/" + this->kernel_name
+                                  + "_v" + std::to_string(this->ctrl_seq->sequence_version())
+                                  + ".bin";
+                try {
+                    this->ctrl_seq->write_out_sequence(fname);
+                    header_print_g("INSTR_DUMP",
+                        "Wrote " << (data.second * 4) << " B -> " << fname);
+                } catch (const std::exception& e) {
+                    header_print_r("INSTR_DUMP", "Failed: " << e.what());
+                }
+            }
+        }
+        // ── end capture ────────────────────────────────────────────────────
+
         uint32_t elf_buf_size = this->_gen_elf(&elf_buf, data);
         if (this->module_valid){
             this->module.reset();
