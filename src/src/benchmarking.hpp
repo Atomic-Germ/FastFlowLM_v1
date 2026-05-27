@@ -198,17 +198,69 @@ void print_result(const BenchmarkResults_t& results) {
     int stages;
     stages = results.decoding_speed.size();
 
+#ifdef _WIN32
+    // Display NPU information on Windows
     header_print("FLM", "=== Benchmark Results ===");
     std::cout << "\n";
+    // TODO: Add Windows NPU info detection here
+    // For now, just proceed with results
+#else
+    // Display NPU information on Linux
+    header_print("FLM", "=== Benchmark Results ===");
+    std::cout << "\n";
+    // TODO: Add Linux NPU info detection here
+#endif
     
     // Print table header
-    std::cout << std::setw(15) << "Context Length" << " | "
-              << std::setw(21) << "TTFT (s)" << " | "
-              << std::setw(26) << "Prefill Speed (tok/s)" << " | "
-              << std::setw(26) << "Decoding Speed (tok/s)" << "\n";
-    std::cout << std::string(100, '-') << "\n";
+    std::cout << std::setw(25) << "model" << " | "
+              << std::setw(15) << "size" << " | "
+              << std::setw(12) << "params" << " | "
+              << std::setw(10) << "backend" << " | "
+              << std::setw(8) << "ngl" << " | "
+              << std::setw(16) << "test" << " | "
+              << std::setw(20) << "t/s" << "\n";
+    std::cout << std::string(130, '-') << "\n";
 
     // Print results for each stage
+    for (int i = 0; i < stages && i < results.decoding_speed.size(); i++) {
+        int context_len = 1 << i;  // 1k, 2k, 4k, 8k, etc.
+        
+        // Prefill test
+        if (i < results.prefill_speed.size()) {
+            std::cout << std::setw(25) << "(prefill)" << " | "
+                      << std::setw(15) << "N/A" << " | "
+                      << std::setw(12) << "N/A" << " | "
+                      << std::setw(10) << "NPU" << " | "
+                      << std::setw(8) << "99" << " | "
+                      << std::setw(16) << "pp" + std::to_string(context_len * 1024) << " | "
+                      << std::setw(20) << std::fixed << std::setprecision(2) << results.prefill_speed[i].average
+                      << " +- " << std::setw(6) << std::setprecision(2) << results.prefill_speed[i].std_variance << "\n";
+        }
+        
+        // Decoding test
+        if (i < results.decoding_speed.size()) {
+            std::cout << std::setw(25) << "(decoding)" << " | "
+                      << std::setw(15) << "N/A" << " | "
+                      << std::setw(12) << "N/A" << " | "
+                      << std::setw(10) << "NPU" << " | "
+                      << std::setw(8) << "99" << " | "
+                      << std::setw(16) << "tg" + std::to_string(128) << " | "
+                      << std::setw(20) << std::fixed << std::setprecision(2) << results.decoding_speed[i].average
+                      << " +- " << std::setw(6) << std::setprecision(2) << results.decoding_speed[i].std_variance << "\n";
+        }
+    }
+    
+    std::cout << std::string(130, '-') << "\n";
+    std::cout << "\n";
+    
+    // Print a simpler summary table as well
+    std::cout << "Summary:" << "\n";
+    std::cout << std::setw(18) << "Context Length" << " | "
+              << std::setw(24) << "TTFT (s)" << " | "
+              << std::setw(26) << "Prefill (tok/s)" << " | "
+              << std::setw(26) << "Decoding (tok/s)" << "\n";
+    std::cout << std::string(100, '-') << "\n";
+
     for (int i = 0; i < stages && i < results.decoding_speed.size(); i++) {
         int context_len = 1 << i;  // 1k, 2k, 4k, 8k, etc.
         
@@ -217,7 +269,7 @@ void print_result(const BenchmarkResults_t& results) {
         // TTFT
         if (i < results.TTFT.size()) {
             std::cout << std::setw(11) << std::fixed << std::setprecision(3) << results.TTFT[i].average
-                      << " ± " << std::setw(7) << std::fixed << std::setprecision(3) << results.TTFT[i].std_variance;
+                      << " +- " << std::setw(7) << std::fixed << std::setprecision(3) << results.TTFT[i].std_variance;
         } else {
             std::cout << std::setw(21) << "N/A";
         }
@@ -226,7 +278,7 @@ void print_result(const BenchmarkResults_t& results) {
         // Prefill Speed
         if (i < results.prefill_speed.size()) {
             std::cout << std::setw(14) << std::fixed << std::setprecision(2) << results.prefill_speed[i].average
-                      << " ± " << std::setw(9) << std::fixed << std::setprecision(2) << results.prefill_speed[i].std_variance;
+                      << " +- " << std::setw(9) << std::fixed << std::setprecision(2) << results.prefill_speed[i].std_variance;
         } else {
             std::cout << std::setw(26) << "N/A";
         }
@@ -235,7 +287,7 @@ void print_result(const BenchmarkResults_t& results) {
         // Decoding Speed
         if (i < results.decoding_speed.size()) {
             std::cout << std::setw(11) << std::fixed << std::setprecision(2) << results.decoding_speed[i].average
-                      << " ± " << std::setw(9) << std::fixed << std::setprecision(2) << results.decoding_speed[i].std_variance;
+                      << " +- " << std::setw(9) << std::fixed << std::setprecision(2) << results.decoding_speed[i].std_variance;
         } else {
             std::cout << std::setw(26) << "N/A";
         }
