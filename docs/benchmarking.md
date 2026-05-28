@@ -1,4 +1,12 @@
-# FastFlowLM Benchmarking Feature
+---
+layout: docs
+title: Benchmarking with flm bench
+nav_order: 3
+parent: Instructions
+permalink: /docs/instructions/benchmarking/
+---
+
+# 📊 Benchmarking with flm bench
 
 ## Overview
 
@@ -42,19 +50,19 @@ The benchmark produces output similar to `llama-bench` format:
 ```
 [FLM] =========================== Benchmark Results ===========================
 
-| model                          |       size |     params | backend    | ngl |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
-| (prefill)                      |        N/A |        N/A | NPU        |  99 |           pp1k |              234.56 ± 10.23 |
-| (decoding)                     |        N/A |        N/A | NPU        |  99 |           tg128 |               45.12 ± 2.15 |
+| phase                          | context | backend    | test       |         throughput (tok/s) |
+| ------------------------------ | ------: | ---------- | ---------- | -------------------------: |
+| prefill                        |      1k | NPU        | pp1k       |           234.56 +/- 10.23 |
+| decoding                       |      1k | NPU        | tg128      |            45.12 +/- 2.15 |
 ...
 
 Summary:
-   Context Length |          TTFT (s) |  Prefill (tok/s) | Decoding (tok/s)
-  -------- -------- -------- -------- -------- -------- -------- -------- -------- -------- -------- -------- -------- -------- -------- -------- -------- --------
-        1k |    0.125 ± 0.003 |    234.56 ± 10.23 |     45.12 ± 2.15 |
-        2k |    0.245 ± 0.005 |    220.34 ± 12.10 |     43.98 ± 2.45 |
-        4k |    0.456 ± 0.008 |    198.76 ± 15.30 |     42.15 ± 2.89 |
-        8k |    0.890 ± 0.015 |    185.23 ± 18.90 |     40.23 ± 3.12 |
+  | Context Length |            TTFT (s) |     Prefill (tok/s) |    Decoding (tok/s) |
+  | -------------: | ------------------: | -------------------: | -------------------: |
+  |            1k  |       0.125 +/- 0.003 |      234.56 +/- 10.23 |       45.12 +/- 2.15 |
+  |            2k  |       0.245 +/- 0.005 |      220.34 +/- 12.10 |       43.98 +/- 2.45 |
+  |            4k  |       0.456 +/- 0.008 |      198.76 +/- 15.30 |       42.15 +/- 2.89 |
+  |            8k  |       0.890 +/- 0.015 |      185.23 +/- 18.90 |       40.23 +/- 3.12 |
 ```
 
 ## Output Metrics
@@ -63,19 +71,19 @@ Summary:
 - **Definition**: The time it takes from sending a request to receiving the first token of output
 - **Measured in**: Seconds
 - **Includes**: Prefill latency + overhead
-- **Displayed as**: `average ± standard_deviation`
+- **Displayed as**: `average +/- standard_deviation`
 
 ### Prefill Speed (Prefill Throughput)
 - **Definition**: Number of prompt tokens processed per second during the prefill phase
 - **Measured in**: Tokens per second (tok/s)
 - **Higher is better**: More efficient prompt processing
-- **Displayed as**: `average ± standard_deviation`
+- **Displayed as**: `average +/- standard_deviation`
 
 ### Decoding Speed (Autoregressive Generation Speed)
 - **Definition**: Number of output tokens generated per second during the decoding phase
 - **Measured in**: Tokens per second (tok/s)
 - **Higher is better**: Faster text generation
-- **Displayed as**: `average ± standard_deviation`
+- **Displayed as**: `average +/- standard_deviation`
 
 ## Benchmark Configuration
 

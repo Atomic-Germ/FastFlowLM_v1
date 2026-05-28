@@ -540,28 +540,33 @@ Example:
 
 ## 📊 Benchmarking Tool
 
-Use the FLM benchmarking tool to measure a model's performance across different context lengths.
-
-Each benchmark tests context lengths from `1k` to `32k`, running `8` iterations at each length.
+Use `flm bench` to measure model performance across context lengths on your NPU.
 
 ```shell
 flm bench llama3.2:1b
 ```
 
-FLM prints the results in your terminal and also saves them as a CSV file in the current folder for later reference.
+Use a custom config file:
+
+```shell
+flm bench llama3.2:1b --prompt bench_config.json
+```
+
+FLM prints results in your terminal and saves a CSV file in the current folder.
+
+For full usage, metrics, power modes, output format, and troubleshooting, see [Benchmarking with flm bench](/docs/instructions/benchmarking/).
 
 ```text
-[FLM]  === Benchmark Results ===
+[FLM]  =========================== Benchmark Results ===========================
 
- Context Length |              TTFT (s) |      Prefill Speed (tok/s) |     Decoding Speed (tok/s)
-----------------------------------------------------------------------------------------------------
-             1k |       0.815 ±   0.012 |        1233.57 ±     17.91 |       61.39 ±      0.46
-             2k |       1.144 ±   0.035 |        1728.16 ±     55.68 |       59.04 ±      0.36
-             4k |       1.955 ±   0.009 |        2001.55 ±      9.22 |       54.32 ±      0.47
-             8k |       3.821 ±   0.010 |        2037.62 ±      5.40 |       46.89 ±      0.19
-            16k |       9.144 ±   0.011 |        1698.20 ±      2.08 |       37.20 ±      0.14
-            32k |      26.346 ±   0.037 |        1177.16 ±      1.53 |       26.38 ±      0.07
-----------------------------------------------------------------------------------------------------
+| Context Length |            TTFT (s) |     Prefill (tok/s) |    Decoding (tok/s) |
+| -------------: | ------------------: | -------------------: | -------------------: |
+|            1k  |     0.815 +/- 0.012 |    1233.57 +/- 17.91 |      61.39 +/- 0.46 |
+|            2k  |     1.144 +/- 0.035 |    1728.16 +/- 55.68 |      59.04 +/- 0.36 |
+|            4k  |     1.955 +/- 0.009 |     2001.55 +/- 9.22 |      54.32 +/- 0.47 |
+|            8k  |     3.821 +/- 0.010 |     2037.62 +/- 5.40 |      46.89 +/- 0.19 |
+|           16k  |     9.144 +/- 0.011 |     1698.20 +/- 2.08 |      37.20 +/- 0.14 |
+|           32k  |    26.346 +/- 0.037 |     1177.16 +/- 1.53 |      26.38 +/- 0.07 |
 ```
 
 ---

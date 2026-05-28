@@ -19,6 +19,7 @@ This section will walk you through how to use FastFlowLM with examples.
 ## 📚 Sections
 
 - [System Command and CLI Mode](cli/)
+- [Benchmarking with flm bench](benchmarking/)
 - [Server Mode](server/)
 - [Server Basics](server/basics/)
 - [API / Client Usage](server/openapi/)

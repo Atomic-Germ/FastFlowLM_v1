@@ -92,6 +92,8 @@ docs_nav:
         url: "/docs/instructions/"
       - label: Sys Command and CLI Mode
         url: "/docs/instructions/cli/"
+      - label: Benchmarking (flm bench)
+        url: "/docs/instructions/benchmarking/"
       - label: Server Mode
         url: "/docs/instructions/server/"  
       - label: Server Basics
