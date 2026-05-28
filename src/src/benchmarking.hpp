@@ -10,6 +10,8 @@
 #include <cctype>
 #include <ctime>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #ifdef _WIN32
 #include <intrin.h>
 #endif
@@ -307,40 +309,67 @@ BenchmarkResults_t run_benchmarks(std::string model_tag, std::string bench_confi
     else {
         std::ifstream input_file(bench_config_file);
         if (!input_file.is_open()) {
-            header_print_r("ERROR", "Failed to open input file: " + bench_config_file);
-            return results;
+            throw std::runtime_error("Failed to open input file: " + bench_config_file);
         }
-        bench_config = nlohmann::json::parse(input_file);
+        try {
+            bench_config = nlohmann::json::parse(input_file);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string("Failed to parse benchmark config '") + bench_config_file + "': " + e.what());
+        }
         input_file.close();
     }
+
+    if (!bench_config.contains("max_length") || !bench_config["max_length"].is_number_integer()) {
+        throw std::runtime_error("Invalid benchmark config: 'max_length' must be an integer.");
+    }
+    if (!bench_config.contains("iterations") || !bench_config["iterations"].is_number_integer()) {
+        throw std::runtime_error("Invalid benchmark config: 'iterations' must be an integer.");
+    }
+    if (!bench_config.contains("input_text") || !bench_config["input_text"].is_string()) {
+        throw std::runtime_error("Invalid benchmark config: 'input_text' must be a string.");
+    }
+
+    int configured_max_length = bench_config["max_length"].get<int>();
+    int iterations = bench_config["iterations"].get<int>();
+    if (iterations <= 0) {
+        throw std::runtime_error("Invalid benchmark config: 'iterations' must be > 0.");
+    }
+
+    // Stage math assumes 1k minimum; silently clamp to avoid invalid/negative stage counts.
+    int stage_max_length = std::max(1024, configured_max_length);
 
     xrt::device npu_device_inst = xrt::device(0);
     std::unique_ptr<AutoModel> auto_chat_engine;
     if (!availble_models.is_model_supported(model_tag)) {
-        header_print_r("ERROR", "Model not found: " << model_tag << "; Please check with `flm list` and try again.");
-        return results;
+        throw std::runtime_error("Model not found: " + model_tag + "; please check with 'flm list' and try again.");
     }
     auto [new_tag, model_info] = availble_models.get_model_info(model_tag);
     std::pair<std::string, std::unique_ptr<AutoModel>> auto_model = get_auto_model(new_tag, availble_models, &npu_device_inst);
     auto_chat_engine = std::move(auto_model.second);
-    int max_len = bench_config["max_length"];
+    int max_len = configured_max_length;
     if (max_len < 8192)
         max_len = 8192;
     auto_chat_engine->load_model(availble_models.get_model_path(model_tag), model_info, max_len, false);
-    std::string input_text = bench_config["input_text"];
+    std::string input_text = bench_config["input_text"].get<std::string>();
     auto [num_tokens, benchmark_text] = auto_chat_engine->prepare_benchmark(input_text);
+    if (benchmark_text.empty()) {
+        throw std::runtime_error("Benchmark input produced empty prompt after tokenization/normalization.");
+    }
 
 
     // get how many steps to do, typically 1k, 2k, 4k, 8k, 16k, 32k
     int stages;
     {
-        float max_length = (float)bench_config["max_length"];
+        float max_length = static_cast<float>(stage_max_length);
         float log2_num_tokens = std::log2(max_length);
         if (log2_num_tokens != std::floor(log2_num_tokens)){
             max_length = 1 << ((int)std::floor(log2_num_tokens) + 1);
         }
         log2_num_tokens = std::log2(max_length / 1024);
         stages = (int)std::floor(log2_num_tokens) + 1;
+    }
+    if (stages <= 0) {
+        throw std::runtime_error("Internal benchmark error: computed non-positive stage count from max_length.");
     }
     header_print("FLM", "Starting benchmark with " + std::to_string(stages) + " stages...");
 
@@ -357,14 +386,15 @@ BenchmarkResults_t run_benchmarks(std::string model_tag, std::string bench_confi
     prefill_speed.resize(stages);
     decoding_speed.resize(stages);
     
-    for (int it = 0; it < bench_config["iterations"]; it++) {
+    for (int it = 0; it < iterations; it++) {
         for (int bench_len = stages - 1; bench_len >= 0; bench_len--)
         {
             header_print("FLM", "Starting benchmark for " + std::to_string((1 << (bench_len))) << "k and iteration " << (it + 1) << "...");
+            int repeat_count = 1 << bench_len;
             std::string long_text;
-            long_text.reserve((1 << (bench_len)) * 1024);
-            for (int i = 0; i < (1 << (bench_len)); i++) {
-                long_text = long_text + benchmark_text;
+            long_text.reserve(static_cast<size_t>(repeat_count) * benchmark_text.size());
+            for (int i = 0; i < repeat_count; i++) {
+                long_text.append(benchmark_text);
             }
             
             lm_uniform_input_t uniformed_input;
@@ -378,9 +408,28 @@ BenchmarkResults_t run_benchmarks(std::string model_tag, std::string bench_confi
             auto_chat_engine->stop_ttft_timer();
             auto_chat_engine->generate(meta_info, 32, null_stream);
 
+            if (meta_info.prefill_duration <= 0 || meta_info.decoding_duration <= 0) {
+                std::ostringstream diag;
+                diag << "Invalid benchmark timing at stage " << (1 << bench_len) << "k, iteration " << (it + 1)
+                     << ": prefill_duration=" << meta_info.prefill_duration
+                     << " ns, decoding_duration=" << meta_info.decoding_duration
+                     << " ns, prompt_tokens=" << meta_info.prompt_tokens
+                     << ", generated_tokens=" << meta_info.generated_tokens;
+                throw std::runtime_error(diag.str());
+            }
+
             ttft[bench_len].push_back((float)auto_chat_engine->get_ttft()); // in second
             prefill_speed[bench_len].push_back((float)meta_info.prompt_tokens / (meta_info.prefill_duration / 1e9)); // in tokens per second
             decoding_speed[bench_len].push_back((float)meta_info.generated_tokens / (meta_info.decoding_duration / 1e9)); // in second
+
+            if (!std::isfinite(prefill_speed[bench_len].back()) || !std::isfinite(decoding_speed[bench_len].back())) {
+                std::ostringstream diag;
+                diag << "Non-finite throughput at stage " << (1 << bench_len) << "k, iteration " << (it + 1)
+                     << ": prefill=" << prefill_speed[bench_len].back()
+                     << ", decoding=" << decoding_speed[bench_len].back();
+                throw std::runtime_error(diag.str());
+            }
+
             header_print("FLM", "\tTTFT: " << ttft[bench_len].back() << "s, Prefill Speed: " << prefill_speed[bench_len].back() << " tokens/s, Decoding Speed: " << decoding_speed[bench_len].back() << " tokens/s");
             auto_chat_engine->clear_context();
             // sleep for 1 second between benchmarks to avoid overheating or memory issues
@@ -389,6 +438,9 @@ BenchmarkResults_t run_benchmarks(std::string model_tag, std::string bench_confi
     }
 
     for (int bench_len = 0; bench_len < stages; bench_len++) {
+        if (ttft[bench_len].empty() || prefill_speed[bench_len].empty() || decoding_speed[bench_len].empty()) {
+            throw std::runtime_error("Benchmark aborted before collecting complete samples for at least one stage.");
+        }
         results.TTFT[bench_len].calculate_statistics(ttft[bench_len]);
         results.prefill_speed[bench_len].calculate_statistics(prefill_speed[bench_len]);
         results.decoding_speed[bench_len].calculate_statistics(decoding_speed[bench_len]);
