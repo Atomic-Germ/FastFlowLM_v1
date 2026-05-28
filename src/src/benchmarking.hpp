@@ -76,6 +76,13 @@ inline std::string format_float_csv(float value, int precision) {
     return ss.str();
 }
 
+inline std::string format_mean_std(float mean, float stddev, int precision) {
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(precision) << mean
+       << " +/- " << std::fixed << std::setprecision(precision) << stddev;
+    return ss.str();
+}
+
 inline std::string get_date_yyyymmdd() {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -117,7 +124,7 @@ inline std::string get_cpu_name() {
 #endif
 }
 
-inline void write_bench_csv(const BenchmarkResults_t& results, const std::string& model_tag, const std::string& output_dir = ".") {
+inline std::string write_bench_csv(const BenchmarkResults_t& results, const std::string& model_tag, const std::string& output_dir = ".") {
     std::string safe_tag = sanitize_model_tag_for_filename(model_tag);
     std::string date_stamp = get_date_yyyymmdd();
     std::string cpu_name = sanitize_model_tag_for_filename(get_cpu_name());
@@ -134,7 +141,7 @@ inline void write_bench_csv(const BenchmarkResults_t& results, const std::string
     std::ofstream out(filename, std::ios::out | std::ios::trunc);
     if (!out.is_open()) {
         header_print_r("ERROR", "Failed to open output file: " + filename);
-        return;
+        return {};
     }
 
     out << "context_length_k,ttft_avg_s,ttft_std_s,ttft_min_s,ttft_max_s,prefill_avg_toks_per_s,prefill_std_toks_per_s,prefill_min_toks_per_s,prefill_max_toks_per_s,decoding_avg_toks_per_s,decoding_std_toks_per_s,decoding_min_toks_per_s,decoding_max_toks_per_s\n";
@@ -191,12 +198,12 @@ inline void write_bench_csv(const BenchmarkResults_t& results, const std::string
         out << "\n";
     }
     out.close();
+    return filename;
 }
 
 void print_result(const BenchmarkResults_t& results) {
     // Calculate number of stages (1k, 2k, 4k, ...)
-    int stages;
-    stages = results.decoding_speed.size();
+    int stages = static_cast<int>(results.decoding_speed.size());
 
 #ifdef _WIN32
     // Display NPU information on Windows
@@ -211,90 +218,78 @@ void print_result(const BenchmarkResults_t& results) {
     // TODO: Add Linux NPU info detection here
 #endif
     
-    // Print table header
-    std::cout << std::setw(25) << "model" << " | "
-              << std::setw(15) << "size" << " | "
-              << std::setw(12) << "params" << " | "
-              << std::setw(10) << "backend" << " | "
-              << std::setw(8) << "ngl" << " | "
-              << std::setw(16) << "test" << " | "
-              << std::setw(20) << "t/s" << "\n";
-    std::cout << std::string(130, '-') << "\n";
+    // Print per-stage throughput table
+    std::cout << std::left
+              << std::setw(12) << "phase" << " | "
+              << std::setw(8) << "context" << " | "
+              << std::setw(8) << "backend" << " | "
+              << std::setw(10) << "test" << " | "
+              << std::setw(22) << "throughput (tok/s)" << "\n";
+    std::cout << std::string(70, '-') << "\n";
 
     // Print results for each stage
     for (int i = 0; i < stages && i < results.decoding_speed.size(); i++) {
         int context_len = 1 << i;  // 1k, 2k, 4k, 8k, etc.
         
-        // Prefill test
-        if (i < results.prefill_speed.size()) {
-            std::cout << std::setw(25) << "(prefill)" << " | "
-                      << std::setw(15) << "N/A" << " | "
-                      << std::setw(12) << "N/A" << " | "
-                      << std::setw(10) << "NPU" << " | "
-                      << std::setw(8) << "99" << " | "
-                      << std::setw(16) << "pp" + std::to_string(context_len * 1024) << " | "
-                      << std::setw(20) << std::fixed << std::setprecision(2) << results.prefill_speed[i].average
-                      << " +- " << std::setw(6) << std::setprecision(2) << results.prefill_speed[i].std_variance << "\n";
+        if (i < static_cast<int>(results.prefill_speed.size())) {
+            std::string prefill_test = "pp" + std::to_string(context_len) + "k";
+            std::cout << std::left
+                      << std::setw(12) << "prefill" << " | "
+                      << std::setw(8) << (std::to_string(context_len) + "k") << " | "
+                      << std::setw(8) << "NPU" << " | "
+                      << std::setw(10) << prefill_test << " | "
+                      << std::setw(22) << format_mean_std(results.prefill_speed[i].average, results.prefill_speed[i].std_variance, 2)
+                      << "\n";
         }
-        
-        // Decoding test
-        if (i < results.decoding_speed.size()) {
-            std::cout << std::setw(25) << "(decoding)" << " | "
-                      << std::setw(15) << "N/A" << " | "
-                      << std::setw(12) << "N/A" << " | "
-                      << std::setw(10) << "NPU" << " | "
-                      << std::setw(8) << "99" << " | "
-                      << std::setw(16) << "tg" + std::to_string(128) << " | "
-                      << std::setw(20) << std::fixed << std::setprecision(2) << results.decoding_speed[i].average
-                      << " +- " << std::setw(6) << std::setprecision(2) << results.decoding_speed[i].std_variance << "\n";
+
+        if (i < static_cast<int>(results.decoding_speed.size())) {
+            std::cout << std::left
+                      << std::setw(12) << "decoding" << " | "
+                      << std::setw(8) << (std::to_string(context_len) + "k") << " | "
+                      << std::setw(8) << "NPU" << " | "
+                      << std::setw(10) << "tg128" << " | "
+                      << std::setw(22) << format_mean_std(results.decoding_speed[i].average, results.decoding_speed[i].std_variance, 2)
+                      << "\n";
         }
     }
-    
-    std::cout << std::string(130, '-') << "\n";
+
+    std::cout << std::string(70, '-') << "\n";
     std::cout << "\n";
     
     // Print a simpler summary table as well
     std::cout << "Summary:" << "\n";
-    std::cout << std::setw(18) << "Context Length" << " | "
-              << std::setw(24) << "TTFT (s)" << " | "
-              << std::setw(26) << "Prefill (tok/s)" << " | "
-              << std::setw(26) << "Decoding (tok/s)" << "\n";
-    std::cout << std::string(100, '-') << "\n";
+    std::cout << std::left
+              << std::setw(16) << "Context Length" << " | "
+              << std::setw(20) << "TTFT (s)" << " | "
+              << std::setw(22) << "Prefill (tok/s)" << " | "
+              << std::setw(22) << "Decoding (tok/s)" << "\n";
+    std::cout << std::string(92, '-') << "\n";
 
     for (int i = 0; i < stages && i < results.decoding_speed.size(); i++) {
         int context_len = 1 << i;  // 1k, 2k, 4k, 8k, etc.
         
-        std::cout << std::setw(14) << context_len << "k" << " | ";
-        
-        // TTFT
-        if (i < results.TTFT.size()) {
-            std::cout << std::setw(11) << std::fixed << std::setprecision(3) << results.TTFT[i].average
-                      << " +- " << std::setw(7) << std::fixed << std::setprecision(3) << results.TTFT[i].std_variance;
-        } else {
-            std::cout << std::setw(21) << "N/A";
+        std::string ttft_text = "N/A";
+        std::string prefill_text = "N/A";
+        std::string decoding_text = "N/A";
+
+        if (i < static_cast<int>(results.TTFT.size())) {
+            ttft_text = format_mean_std(results.TTFT[i].average, results.TTFT[i].std_variance, 3);
         }
-        std::cout << " | ";
-        
-        // Prefill Speed
-        if (i < results.prefill_speed.size()) {
-            std::cout << std::setw(14) << std::fixed << std::setprecision(2) << results.prefill_speed[i].average
-                      << " +- " << std::setw(9) << std::fixed << std::setprecision(2) << results.prefill_speed[i].std_variance;
-        } else {
-            std::cout << std::setw(26) << "N/A";
+        if (i < static_cast<int>(results.prefill_speed.size())) {
+            prefill_text = format_mean_std(results.prefill_speed[i].average, results.prefill_speed[i].std_variance, 2);
         }
-        std::cout << " | ";
-        
-        // Decoding Speed
-        if (i < results.decoding_speed.size()) {
-            std::cout << std::setw(11) << std::fixed << std::setprecision(2) << results.decoding_speed[i].average
-                      << " +- " << std::setw(9) << std::fixed << std::setprecision(2) << results.decoding_speed[i].std_variance;
-        } else {
-            std::cout << std::setw(26) << "N/A";
+        if (i < static_cast<int>(results.decoding_speed.size())) {
+            decoding_text = format_mean_std(results.decoding_speed[i].average, results.decoding_speed[i].std_variance, 2);
         }
-        std::cout << "\n";
+
+        std::cout << std::left
+                  << std::setw(16) << (std::to_string(context_len) + "k") << " | "
+                  << std::setw(20) << ttft_text << " | "
+                  << std::setw(22) << prefill_text << " | "
+                  << std::setw(22) << decoding_text << "\n";
     }
-    
-    std::cout << std::string(100, '-') << "\n";
+
+    std::cout << std::string(92, '-') << "\n";
     std::cout << "\n";
 }
 
@@ -402,7 +397,10 @@ BenchmarkResults_t run_benchmarks(std::string model_tag, std::string bench_confi
     auto_chat_engine.reset();
 
     print_result(results);
-    write_bench_csv(results, new_tag, ".");
+    std::string csv_file = write_bench_csv(results, new_tag, ".");
+    if (!csv_file.empty()) {
+        header_print("FLM", "Benchmark CSV saved to: " + csv_file);
+    }
     return results;
 }
 
