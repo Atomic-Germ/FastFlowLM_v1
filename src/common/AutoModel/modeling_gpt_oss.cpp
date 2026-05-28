@@ -6,6 +6,49 @@
 /// \note This is a source file for the gpt-oss class
 #include "AutoModel/modeling_gpt_oss.hpp"   
 
+static std::string normalize_tool_args(const std::string& tool_name, const std::string& raw_args) {
+    if (raw_args.empty()) {
+        return raw_args;
+    }
+
+    try {
+        auto j = nlohmann::json::parse(raw_args);
+        if (!j.is_object()) {
+            return raw_args;
+        }
+
+        if (tool_name == "bash") {
+            if (!j.contains("command")) {
+                if (j.contains("arg") && j["arg"].is_string()) {
+                    std::string cmd = j["arg"].get<std::string>();
+                    // Avoid converting clearly non-command multiline content.
+                    if (!cmd.empty() && cmd.find('\n') == std::string::npos && cmd.find('\r') == std::string::npos) {
+                        j["command"] = cmd;
+                        j.erase("arg");
+                    }
+                }
+                else if (j.contains("arg") && j["arg"].is_object()) {
+                    auto arg_obj = j["arg"];
+                    if (arg_obj.contains("command") && arg_obj["command"].is_string()) {
+                        j["command"] = arg_obj["command"].get<std::string>();
+                        j.erase("arg");
+                    }
+                }
+                else if (j.contains("result") && j["result"].is_string()) {
+                    std::string cmd = j["result"].get<std::string>();
+                    if (!cmd.empty() && cmd.find('\n') == std::string::npos && cmd.find('\r') == std::string::npos) {
+                        j["command"] = cmd;
+                    }
+                }
+            }
+        }
+
+        return j.dump();
+    } catch (...) {
+        return raw_args;
+    }
+}
+
 
 GPT_OSS::GPT_OSS(xrt::device* npu_device_inst) : AutoModel(npu_device_inst, "gpt-oss") {}
 
@@ -42,17 +85,76 @@ void GPT_OSS::setup_tokenizer(std::string model_path){
 std::string GPT_OSS::apply_chat_template(nlohmann::ordered_json& messages, nlohmann::ordered_json tools) {
     minja::chat_template_inputs inputs;
     inputs.add_generation_prompt = true;
-    inputs.messages = messages;
+    nlohmann::ordered_json templated_messages = messages;
+
+    if (!tools.empty()) {
+        // Some GPT-OSS templates do not reliably render tool definitions.
+        // Inject an explicit system instruction with the exact call format
+        // expected by our parser/runtime to prevent fabricated answers.
+        bool has_tool_result = false;
+        for (auto& msg : messages) {
+            if (msg.contains("role") && msg["role"].is_string() && msg["role"].get<std::string>() == "tool") {
+                has_tool_result = true;
+                break;
+            }
+        }
+
+        std::string tool_system =
+            "# Tools\n\n"
+            "You MUST use tools when the user request requires external data, files, or command execution.\n"
+            "Never fabricate command outputs or file listings.\n\n"
+            "Available functions:\n";
+        for (auto& tool : tools) {
+            tool_system += "- " + tool.dump() + "\n";
+        }
+        tool_system +=
+            "\nWhen calling a function, output ONLY this format:\n"
+            "<|channel|>final <|constrain|>functions.<function_name><|message|>{\"arg\":\"value\"}<|call|>\n"
+            "Do not output normal assistant content before or instead of a function call when a tool is needed.\n"
+            "For bash calls, arguments MUST include key \"command\" as a string.\n"
+            "Do NOT use \"arg\" as the top-level key for bash.";
+
+        if (has_tool_result) {
+            tool_system +=
+                "\n\n# Tool result grounding\n"
+                "A tool result is present in the conversation.\n"
+                "Your final answer MUST be grounded only in that tool output.\n"
+                "Do not add files, paths, or values that are not explicitly in the tool output.\n"
+                "If details are missing, say they are not shown instead of guessing.";
+        }
+
+        nlohmann::ordered_json modified = nlohmann::ordered_json::array();
+        if (!messages.empty() && messages[0].contains("role") && messages[0]["role"] == "system") {
+            nlohmann::ordered_json sys = messages[0];
+            std::string existing = (messages[0].contains("content") && messages[0]["content"].is_string())
+                ? messages[0]["content"].get<std::string>() : "";
+            sys["content"] = tool_system + (existing.empty() ? "" : "\n\n" + existing);
+            modified.push_back(sys);
+            for (size_t i = 1; i < messages.size(); ++i) {
+                modified.push_back(messages[i]);
+            }
+        }
+        else {
+            modified.push_back({{"role", "system"}, {"content", tool_system}});
+            for (auto& msg : messages) {
+                modified.push_back(msg);
+            }
+        }
+        templated_messages = modified;
+    }
+
+    inputs.messages = templated_messages;
+    if (!tools.empty()) {
+        inputs.tools = tools;
+    }
     inputs.extra_context = this->extra_context;
     inputs.extra_context["enable_thinking"] = this->enable_think;
     inputs.extra_context["reasoning_effort"] = this->reasoning_effort;
     inputs.extra_context["model_identity"] = this->model_identity;
     inputs.extra_context["role"] = this->role;
-    //inputs.tools = tools;
 
     return this->chat_tmpl->apply(inputs);
 }
-json tools;
 bool GPT_OSS::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std::function<bool()> is_cancelled)
 {
     // preprocess
@@ -63,15 +165,14 @@ bool GPT_OSS::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std
         return false;
     }
     if (!input.messages.empty()) { // already a formated messages, usually from REST API
-        tools = input.tools;
-        templated_text = this->apply_chat_template(input.messages);
-        //templated_text = this->apply_chat_template(input.messages, input.tools);
+        this->tools = input.tools;
+        templated_text = this->apply_chat_template(input.messages, input.tools);
     }
     else if (!input.prompt.empty()) { // a pure text, usually from the cli
         nlohmann::ordered_json messages;
 
         messages.push_back({ {"role", "user"}, {"content", input.prompt} });
-        templated_text = this->apply_chat_template(messages);
+        templated_text = this->apply_chat_template(messages, input.tools);
     }
 
     std::vector<int> tokens = this->tokenizer->encode(templated_text);
@@ -300,27 +401,198 @@ std::string GPT_OSS::generate_with_prompt(chat_meta_info_t& meta_info, lm_unifor
 NonStreamResult GPT_OSS::parse_nstream_content(const std::string response_text) {    
     NonStreamResult result;
 
+    auto parse_function_envelope = [](const std::string& text, std::string& out_name, std::string& out_args) -> bool {
+        std::string s = text;
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\n' || s.front() == '\r' || s.front() == '\t')) {
+            s.erase(s.begin());
+        }
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\n' || s.back() == '\r' || s.back() == '\t')) {
+            s.pop_back();
+        }
+        if (s.empty()) {
+            return false;
+        }
+
+        try {
+            auto j = nlohmann::json::parse(s);
+            if (!j.is_object()) {
+                return false;
+            }
+
+            if (j.contains("type") && j["type"].is_string() && j["type"].get<std::string>() == "function" &&
+                j.contains("name") && j["name"].is_string()) {
+                out_name = j["name"].get<std::string>();
+                if (j.contains("parameters")) {
+                    out_args = j["parameters"].is_string() ? j["parameters"].get<std::string>() : j["parameters"].dump();
+                } else {
+                    out_args = "{}";
+                }
+                out_args = normalize_tool_args(out_name, out_args);
+                return true;
+            }
+
+            if (j.contains("name") && j["name"].is_string() && j.contains("arguments")) {
+                out_name = j["name"].get<std::string>();
+                out_args = j["arguments"].is_string() ? j["arguments"].get<std::string>() : j["arguments"].dump();
+                out_args = normalize_tool_args(out_name, out_args);
+                return true;
+            }
+        } catch (...) {}
+
+        return false;
+    };
+
     const std::string think_start_tag = "<|start|>assistant<|channel|>analysis<|message|>";
+    const std::string think_start_tag_short = "<|channel|>analysis<|message|>";
     const std::string think_end_tag = "<|end|>";
     const std::string final_start_tag = "<|start|>assistant<|channel|>final<|message|>";
+    const std::string final_start_tag_short = "<|channel|>final<|message|>";
     const std::string final_end_tag = "<|end|>";
 
     // --- Parse reasoning content ---
     size_t t_start = response_text.find(think_start_tag);
-    size_t t_end = response_text.find(think_end_tag, t_start + think_start_tag.size());
+    size_t think_tag_len = think_start_tag.size();
+    if (t_start == std::string::npos) {
+        t_start = response_text.find(think_start_tag_short);
+        think_tag_len = think_start_tag_short.size();
+    }
+    size_t t_end = response_text.find(think_end_tag, t_start == std::string::npos ? 0 : t_start + think_tag_len);
 
     if (t_start != std::string::npos && t_end != std::string::npos) {
-        t_start += think_start_tag.size();
+        t_start += think_tag_len;
         result.reasoning_content = response_text.substr(t_start, t_end - t_start);
     }
 
     // --- Parse final content ---
     size_t f_start = response_text.find(final_start_tag);
-    size_t f_end = response_text.find(final_end_tag, f_start + final_start_tag.size());
+    size_t final_tag_len = final_start_tag.size();
+    if (f_start == std::string::npos) {
+        f_start = response_text.find(final_start_tag_short);
+        final_tag_len = final_start_tag_short.size();
+    }
+    size_t f_end = response_text.find(final_end_tag, f_start == std::string::npos ? 0 : f_start + final_tag_len);
 
     if (f_start != std::string::npos && f_end != std::string::npos) {
-        f_start += final_start_tag.size();
+        f_start += final_tag_len;
         result.content = response_text.substr(f_start, f_end - f_start);
+        if (parse_function_envelope(result.content, result.tool_name, result.tool_args)) {
+            result.content.clear();
+            return result;
+        }
+    }
+
+    // Parse harmony-style tool calls:
+    // <|start|>assistant<|channel|>commentary to=functions.<name> ... <|message|>{...}<|call|><|end|>
+    const std::string tool_start_tag = "<|start|>assistant<|channel|>commentary to=functions.";
+    const std::string tool_start_tag_short = "<|channel|>commentary to=functions.";
+    const std::string tool_start_tag_constrain = "<|start|>assistant<|channel|>final <|constrain|>functions.";
+    const std::string tool_start_tag_constrain_no_space = "<|start|>assistant<|channel|>final<|constrain|>functions.";
+    const std::string tool_start_tag_constrain_short = "<|channel|>final <|constrain|>functions.";
+    const std::string tool_start_tag_constrain_short_no_space = "<|channel|>final<|constrain|>functions.";
+    const std::string tool_start_tag_plain = "<|start|>assistant<|channel|>final functions.";
+    const std::string tool_start_tag_plain_double_space = "<|start|>assistant<|channel|>final  functions.";
+    const std::string tool_start_tag_plain_short = "<|channel|>final functions.";
+    const std::string tool_start_tag_plain_short_double_space = "<|channel|>final  functions.";
+    const std::string tool_msg_split = "<|message|>";
+    const std::string tool_call_marker = "<|call|>";
+    size_t tc_start = std::string::npos;
+    size_t tool_tag_len = 0;
+
+    auto update_tool_start = [&](const std::string& marker) {
+        size_t pos = response_text.find(marker);
+        if (pos != std::string::npos && (tc_start == std::string::npos || pos < tc_start)) {
+            tc_start = pos;
+            tool_tag_len = marker.size();
+        }
+    };
+
+    update_tool_start(tool_start_tag);
+    update_tool_start(tool_start_tag_short);
+    update_tool_start(tool_start_tag_constrain);
+    update_tool_start(tool_start_tag_constrain_no_space);
+    update_tool_start(tool_start_tag_constrain_short);
+    update_tool_start(tool_start_tag_constrain_short_no_space);
+    update_tool_start(tool_start_tag_plain);
+    update_tool_start(tool_start_tag_plain_double_space);
+    update_tool_start(tool_start_tag_plain_short);
+    update_tool_start(tool_start_tag_plain_short_double_space);
+
+    size_t tc_end = response_text.find("<|end|>", tc_start == std::string::npos ? 0 : tc_start + tool_tag_len);
+    if (tc_start != std::string::npos && tc_end != std::string::npos) {
+        std::string tool_block = response_text.substr(tc_start + tool_tag_len, tc_end - (tc_start + tool_tag_len));
+        size_t split_pos = tool_block.find(tool_msg_split);
+        if (split_pos != std::string::npos) {
+            std::string meta_part = tool_block.substr(0, split_pos);
+            size_t name_end = meta_part.find_first_of(" <\n\r\t");
+            result.tool_name = meta_part.substr(0, name_end);
+
+            std::string args_part = tool_block.substr(split_pos + tool_msg_split.length());
+            size_t call_pos = args_part.find(tool_call_marker);
+            if (call_pos != std::string::npos) {
+                args_part = args_part.substr(0, call_pos);
+            }
+            while (!args_part.empty() && (args_part.back() == ' ' || args_part.back() == '\n' || args_part.back() == '\r' || args_part.back() == '\t')) {
+                args_part.pop_back();
+            }
+            while (!args_part.empty() && (args_part.front() == ' ' || args_part.front() == '\n' || args_part.front() == '\r' || args_part.front() == '\t')) {
+                args_part.erase(args_part.begin());
+            }
+            if (!args_part.empty()) {
+                try {
+                    result.tool_args = nlohmann::json::parse(args_part).dump();
+                } catch (...) {
+                    result.tool_args = args_part;
+                }
+                result.tool_args = normalize_tool_args(result.tool_name, result.tool_args);
+            }
+            return result;
+        }
+        else {
+            // Compact legacy form: functions.<name>{...}<|call|>
+            size_t json_start = tool_block.find('{');
+            if (json_start != std::string::npos) {
+                std::string name_part = tool_block.substr(0, json_start);
+                size_t name_end = name_part.find_first_of(" <\n\r\t");
+                result.tool_name = name_part.substr(0, name_end);
+
+                std::string args_part = tool_block.substr(json_start);
+                size_t call_pos = args_part.find(tool_call_marker);
+                if (call_pos != std::string::npos) {
+                    args_part = args_part.substr(0, call_pos);
+                }
+                while (!args_part.empty() && (args_part.back() == ' ' || args_part.back() == '\n' || args_part.back() == '\r' || args_part.back() == '\t')) {
+                    args_part.pop_back();
+                }
+                if (!args_part.empty()) {
+                    try {
+                        result.tool_args = nlohmann::json::parse(args_part).dump();
+                    } catch (...) {
+                        result.tool_args = args_part;
+                    }
+                    result.tool_args = normalize_tool_args(result.tool_name, result.tool_args);
+                    return result;
+                }
+            }
+        }
+    }
+
+    // Fallback parser for generic <tool_call>{"name":...,"arguments":...}</tool_call> format.
+    const std::string xml_tool_start = "<tool_call>";
+    const std::string xml_tool_end = "</tool_call>";
+    size_t xml_start = response_text.find(xml_tool_start);
+    size_t xml_end = response_text.find(xml_tool_end, xml_start == std::string::npos ? 0 : xml_start + xml_tool_start.size());
+    if (xml_start != std::string::npos && xml_end != std::string::npos) {
+        std::string json_str = response_text.substr(xml_start + xml_tool_start.size(), xml_end - (xml_start + xml_tool_start.size()));
+        try {
+            auto j = nlohmann::json::parse(json_str);
+            if (j.contains("name")) {
+                result.tool_name = j["name"].get<std::string>();
+            }
+            if (j.contains("arguments")) {
+                result.tool_args = j["arguments"].is_string() ? j["arguments"].get<std::string>() : j["arguments"].dump();
+                result.tool_args = normalize_tool_args(result.tool_name, result.tool_args);
+            }
+        } catch (...) {}
     }
 
     return result;
@@ -455,12 +727,64 @@ void GPT_OSS::mask_logits(buffer<bf16>& logits, const std::vector<int>& allowed_
 StreamResult GPT_OSS::parse_stream_content(const std::string content) {
     //header_print("GPTOSSHERE", content);
 
+    auto parse_function_envelope = [](const std::string& text, std::string& out_name, std::string& out_args) -> bool {
+        std::string s = text;
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\n' || s.front() == '\r' || s.front() == '\t')) {
+            s.erase(s.begin());
+        }
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\n' || s.back() == '\r' || s.back() == '\t')) {
+            s.pop_back();
+        }
+        if (s.empty()) {
+            return false;
+        }
+
+        try {
+            auto j = nlohmann::json::parse(s);
+            if (!j.is_object()) {
+                return false;
+            }
+
+            if (j.contains("type") && j["type"].is_string() && j["type"].get<std::string>() == "function" &&
+                j.contains("name") && j["name"].is_string()) {
+                out_name = j["name"].get<std::string>();
+                if (j.contains("parameters")) {
+                    out_args = j["parameters"].is_string() ? j["parameters"].get<std::string>() : j["parameters"].dump();
+                } else {
+                    out_args = "{}";
+                }
+                out_args = normalize_tool_args(out_name, out_args);
+                return true;
+            }
+
+            if (j.contains("name") && j["name"].is_string() && j.contains("arguments")) {
+                out_name = j["name"].get<std::string>();
+                out_args = j["arguments"].is_string() ? j["arguments"].get<std::string>() : j["arguments"].dump();
+                out_args = normalize_tool_args(out_name, out_args);
+                return true;
+            }
+        } catch (...) {}
+
+        return false;
+    };
+
     const std::string MARKER_REASONING = "<|start|>assistant<|channel|>analysis<|message|>";
+    const std::string MARKER_REASONING_SHORT = "<|channel|>analysis<|message|>";
     const std::string MARKER_NORMAL = "<|start|>assistant<|channel|>final<|message|>";
+    const std::string MARKER_NORMAL_SHORT = "<|channel|>final<|message|>";
     const std::string MARKER_END = "<|end|>";    
 
     // Markers for Tool Calling
     const std::string MARKER_TOOL_START = "<|start|>assistant<|channel|>commentary to=functions.";
+    const std::string MARKER_TOOL_START_SHORT = "<|channel|>commentary to=functions.";
+    const std::string MARKER_TOOL_START_CONSTRAIN = "<|start|>assistant<|channel|>final <|constrain|>functions.";
+    const std::string MARKER_TOOL_START_CONSTRAIN_NO_SPACE = "<|start|>assistant<|channel|>final<|constrain|>functions.";
+    const std::string MARKER_TOOL_START_CONSTRAIN_SHORT = "<|channel|>final <|constrain|>functions.";
+    const std::string MARKER_TOOL_START_CONSTRAIN_SHORT_NO_SPACE = "<|channel|>final<|constrain|>functions.";
+    const std::string MARKER_TOOL_START_PLAIN = "<|start|>assistant<|channel|>final functions.";
+    const std::string MARKER_TOOL_START_PLAIN_DOUBLE_SPACE = "<|start|>assistant<|channel|>final  functions.";
+    const std::string MARKER_TOOL_START_PLAIN_SHORT = "<|channel|>final functions.";
+    const std::string MARKER_TOOL_START_PLAIN_SHORT_DOUBLE_SPACE = "<|channel|>final  functions.";
     //const std::string MARKER_TOOL_START = "<|start|>assistant<|channel|>commentary <|constrain|>functions.";
     const std::string MARKER_TOOL_SPLIT = "<|message|>"; 
     const std::string MARKER_TOOL_END = "<|end|>";   
@@ -477,8 +801,19 @@ StreamResult GPT_OSS::parse_stream_content(const std::string content) {
     while (true) {
         if (waiting_for_header_) {
             size_t pos_reason = buffer_.find(MARKER_REASONING);
+            size_t pos_reason_short = buffer_.find(MARKER_REASONING_SHORT);
             size_t pos_normal = buffer_.find(MARKER_NORMAL);
+            size_t pos_normal_short = buffer_.find(MARKER_NORMAL_SHORT);
             size_t pos_tool = buffer_.find(MARKER_TOOL_START);
+            size_t pos_tool_short = buffer_.find(MARKER_TOOL_START_SHORT);
+            size_t pos_tool_constrain = buffer_.find(MARKER_TOOL_START_CONSTRAIN);
+            size_t pos_tool_constrain_no_space = buffer_.find(MARKER_TOOL_START_CONSTRAIN_NO_SPACE);
+            size_t pos_tool_constrain_short = buffer_.find(MARKER_TOOL_START_CONSTRAIN_SHORT);
+            size_t pos_tool_constrain_short_no_space = buffer_.find(MARKER_TOOL_START_CONSTRAIN_SHORT_NO_SPACE);
+            size_t pos_tool_plain = buffer_.find(MARKER_TOOL_START_PLAIN);
+            size_t pos_tool_plain_double_space = buffer_.find(MARKER_TOOL_START_PLAIN_DOUBLE_SPACE);
+            size_t pos_tool_plain_short = buffer_.find(MARKER_TOOL_START_PLAIN_SHORT);
+            size_t pos_tool_plain_short_double_space = buffer_.find(MARKER_TOOL_START_PLAIN_SHORT_DOUBLE_SPACE);
 
             // Find which marker appears first
             size_t pos_first = std::string::npos;
@@ -490,15 +825,70 @@ StreamResult GPT_OSS::parse_stream_content(const std::string content) {
                 next_mode = StreamEventType::REASONING;
                 marker_len = MARKER_REASONING.length();
             }
+            if (pos_reason_short != std::string::npos && (pos_first == std::string::npos || pos_reason_short < pos_first)) {
+                pos_first = pos_reason_short;
+                next_mode = StreamEventType::REASONING;
+                marker_len = MARKER_REASONING_SHORT.length();
+            }
             if (pos_normal != std::string::npos && (pos_first == std::string::npos || pos_normal < pos_first)) {
                 pos_first = pos_normal;
                 next_mode = StreamEventType::CONTENT;
                 marker_len = MARKER_NORMAL.length();
             }
+            if (pos_normal_short != std::string::npos && (pos_first == std::string::npos || pos_normal_short < pos_first)) {
+                pos_first = pos_normal_short;
+                next_mode = StreamEventType::CONTENT;
+                marker_len = MARKER_NORMAL_SHORT.length();
+            }
             if (pos_tool != std::string::npos && (pos_first == std::string::npos || pos_tool < pos_first)) {
                 pos_first = pos_tool;
                 next_mode = StreamEventType::WAITING; // Special mode for buffering tool
                 marker_len = MARKER_TOOL_START.length();
+            }
+            if (pos_tool_short != std::string::npos && (pos_first == std::string::npos || pos_tool_short < pos_first)) {
+                pos_first = pos_tool_short;
+                next_mode = StreamEventType::WAITING;
+                marker_len = MARKER_TOOL_START_SHORT.length();
+            }
+            if (pos_tool_constrain != std::string::npos && (pos_first == std::string::npos || pos_tool_constrain < pos_first)) {
+                pos_first = pos_tool_constrain;
+                next_mode = StreamEventType::WAITING;
+                marker_len = MARKER_TOOL_START_CONSTRAIN.length();
+            }
+            if (pos_tool_constrain_no_space != std::string::npos && (pos_first == std::string::npos || pos_tool_constrain_no_space < pos_first)) {
+                pos_first = pos_tool_constrain_no_space;
+                next_mode = StreamEventType::WAITING;
+                marker_len = MARKER_TOOL_START_CONSTRAIN_NO_SPACE.length();
+            }
+            if (pos_tool_constrain_short != std::string::npos && (pos_first == std::string::npos || pos_tool_constrain_short < pos_first)) {
+                pos_first = pos_tool_constrain_short;
+                next_mode = StreamEventType::WAITING;
+                marker_len = MARKER_TOOL_START_CONSTRAIN_SHORT.length();
+            }
+            if (pos_tool_constrain_short_no_space != std::string::npos && (pos_first == std::string::npos || pos_tool_constrain_short_no_space < pos_first)) {
+                pos_first = pos_tool_constrain_short_no_space;
+                next_mode = StreamEventType::WAITING;
+                marker_len = MARKER_TOOL_START_CONSTRAIN_SHORT_NO_SPACE.length();
+            }
+            if (pos_tool_plain != std::string::npos && (pos_first == std::string::npos || pos_tool_plain < pos_first)) {
+                pos_first = pos_tool_plain;
+                next_mode = StreamEventType::WAITING;
+                marker_len = MARKER_TOOL_START_PLAIN.length();
+            }
+            if (pos_tool_plain_double_space != std::string::npos && (pos_first == std::string::npos || pos_tool_plain_double_space < pos_first)) {
+                pos_first = pos_tool_plain_double_space;
+                next_mode = StreamEventType::WAITING;
+                marker_len = MARKER_TOOL_START_PLAIN_DOUBLE_SPACE.length();
+            }
+            if (pos_tool_plain_short != std::string::npos && (pos_first == std::string::npos || pos_tool_plain_short < pos_first)) {
+                pos_first = pos_tool_plain_short;
+                next_mode = StreamEventType::WAITING;
+                marker_len = MARKER_TOOL_START_PLAIN_SHORT.length();
+            }
+            if (pos_tool_plain_short_double_space != std::string::npos && (pos_first == std::string::npos || pos_tool_plain_short_double_space < pos_first)) {
+                pos_first = pos_tool_plain_short_double_space;
+                next_mode = StreamEventType::WAITING;
+                marker_len = MARKER_TOOL_START_PLAIN_SHORT_DOUBLE_SPACE.length();
             }
 
             // found
@@ -533,16 +923,58 @@ StreamResult GPT_OSS::parse_stream_content(const std::string content) {
                     result.tool_name = meta_part.substr(0, name_end);
 
                     // 2. Extract JSON (Right side)
-                    result.tool_args_str = full_tool_str.substr(pos_split + MARKER_TOOL_SPLIT.length());
+                    std::string args_part = full_tool_str.substr(pos_split + MARKER_TOOL_SPLIT.length());
+                    size_t call_pos = args_part.find("<|call|>");
+                    if (call_pos != std::string::npos) {
+                        args_part = args_part.substr(0, call_pos);
+                    }
+                    while (!args_part.empty() && (args_part.back() == ' ' || args_part.back() == '\n' || args_part.back() == '\r' || args_part.back() == '\t')) {
+                        args_part.pop_back();
+                    }
+                    while (!args_part.empty() && (args_part.front() == ' ' || args_part.front() == '\n' || args_part.front() == '\r' || args_part.front() == '\t')) {
+                        args_part.erase(args_part.begin());
+                    }
+                    try {
+                        result.tool_args_str = nlohmann::json::parse(args_part).dump();
+                    } catch (...) {
+                        result.tool_args_str = args_part;
+                    }
+                    result.tool_args_str = normalize_tool_args(result.tool_name, result.tool_args_str);
 
                     // 3. Set Result
                     result.type = StreamEventType::TOOL_DONE;
                     result.tool_id = "call_" + std::to_string(std::time(nullptr));
                 }
                 else {
-                    // Fallback if format is wrong
-                    result.content = "[Tool Parse Error]";
-                    result.type = StreamEventType::CONTENT;
+                    // Compact legacy form: functions.<name>{...}<|call|>
+                    size_t json_start = full_tool_str.find('{');
+                    if (json_start != std::string::npos) {
+                        std::string name_part = full_tool_str.substr(0, json_start);
+                        size_t name_end = name_part.find_first_of(" <\n\r\t");
+                        result.tool_name = name_part.substr(0, name_end);
+
+                        std::string args_part = full_tool_str.substr(json_start);
+                        size_t call_pos = args_part.find("<|call|>");
+                        if (call_pos != std::string::npos) {
+                            args_part = args_part.substr(0, call_pos);
+                        }
+                        while (!args_part.empty() && (args_part.back() == ' ' || args_part.back() == '\n' || args_part.back() == '\r' || args_part.back() == '\t')) {
+                            args_part.pop_back();
+                        }
+                        try {
+                            result.tool_args_str = nlohmann::json::parse(args_part).dump();
+                        } catch (...) {
+                            result.tool_args_str = args_part;
+                        }
+                        result.tool_args_str = normalize_tool_args(result.tool_name, result.tool_args_str);
+                        result.type = StreamEventType::TOOL_DONE;
+                        result.tool_id = "call_" + std::to_string(std::time(nullptr));
+                    }
+                    else {
+                        // Fallback if format is wrong
+                        result.content = "[Tool Parse Error]";
+                        result.type = StreamEventType::CONTENT;
+                    }
                 }
 
                 // Clean up and reset
@@ -563,8 +995,15 @@ StreamResult GPT_OSS::parse_stream_content(const std::string content) {
 
             if (pos_end != std::string::npos) {
                 // End marker found
-                result.content += buffer_.substr(0, pos_end); // Output content before marker
-                result.type = current_mode_;
+                std::string segment = buffer_.substr(0, pos_end);
+                if (current_mode_ == StreamEventType::CONTENT && parse_function_envelope(segment, result.tool_name, result.tool_args_str)) {
+                    result.type = StreamEventType::TOOL_DONE;
+                    result.tool_id = "call_" + std::to_string(std::time(nullptr));
+                }
+                else {
+                    result.content += segment; // Output content before marker
+                    result.type = current_mode_;
+                }
 
                 // Remove content + marker, ready for next section
                 buffer_ = buffer_.substr(pos_end + MARKER_END.length());
@@ -572,13 +1011,35 @@ StreamResult GPT_OSS::parse_stream_content(const std::string content) {
             }
             else {
                 // No end marker, flush everything immediately
-                result.content += buffer_;
-                result.type = current_mode_;
+                if (current_mode_ == StreamEventType::CONTENT && parse_function_envelope(buffer_, result.tool_name, result.tool_args_str)) {
+                    result.type = StreamEventType::TOOL_DONE;
+                    result.tool_id = "call_" + std::to_string(std::time(nullptr));
+                }
+                else {
+                    result.content += buffer_;
+                    result.type = current_mode_;
+                }
                 buffer_.clear();
                 break; // Done with this chunk
             }
         }
     }
 
+    return result;
+}
+
+StreamResult GPT_OSS::parse_stream_content_final(const std::string content) {
+    if (!content.empty()) {
+        return parse_stream_content(content);
+    }
+
+    // If the model ended without emitting <|end|>, force-close pending blocks
+    // so a detected tool header can still become TOOL_DONE.
+    if (!buffer_.empty() || current_mode_ == StreamEventType::WAITING) {
+        return parse_stream_content("<|end|>");
+    }
+
+    StreamResult result;
+    result.type = StreamEventType::WAITING;
     return result;
 }

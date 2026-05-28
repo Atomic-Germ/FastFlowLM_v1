@@ -206,8 +206,10 @@ public:
 
 	void reset_parser() {
 		buffer_.clear();
+		tool_name_.clear();
 		is_in_tool_block_ = false;
 		current_mode_ = StreamEventType::CONTENT;
+		waiting_for_header_ = true;
 	}
 
 	/// \brief Clear the context

@@ -28,6 +28,7 @@ private:
     };
     ToolGrammarState current_state = STATE_EXPECT_TO_FUNCTIONS;
     std::string accumulated_text;
+    json tools;
     void reset_tool_grammar_state() {
         current_state = STATE_EXPECT_TO_FUNCTIONS;
         accumulated_text.clear();
@@ -47,6 +48,7 @@ public:
     void mask_logits(buffer<bf16>& logits, const std::vector<int>& allowed_tokens);
     NonStreamResult parse_nstream_content(const std::string response_text);
     StreamResult parse_stream_content(const std::string content);
+    StreamResult parse_stream_content_final(const std::string content) override;
     chat_template_type_t get_chat_template_type() {
         return chat_template_type_t::harmony;
     }

@@ -422,9 +422,23 @@ private:
         if (result.type == StreamEventType::WAITING) {
             return;
         }
+
+        // Once a tool call is emitted for this turn, suppress subsequent
+        // assistant content/reasoning chunks to avoid mixed "answer + tool_call" output.
+        if (tool_call_emitted_ && result.type != StreamEventType::TOOL_DONE) {
+            return;
+        }
+
+        // GPT-OSS can emit analysis-channel text that some clients render as normal content.
+        // Suppress reasoning chunks for GPT-OSS in OpenAI chat-completions streaming.
+        if (result.type == StreamEventType::REASONING && model_name.find("gpt-oss") != std::string::npos) {
+            return;
+        }
+
         json delta;
         if (result.type == StreamEventType::TOOL_DONE) {
             stream_stop_reason = stop_reason_t::TOOL_DETECTED;
+            tool_call_emitted_ = true;
             delta = {
                 {"tool_calls", json::array({
                     {
@@ -528,6 +542,7 @@ private:
     ///@brief First chunk flag
     bool first_chunk;
     stop_reason_t stream_stop_reason = stop_reason_t::EOT_DETECTED;
+    bool tool_call_emitted_ = false;
 
     std::unique_ptr<harmony_filter> harmony_filter_inst;
 };
