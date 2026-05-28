@@ -337,6 +337,10 @@ BenchmarkResults_t run_benchmarks(std::string model_tag, std::string bench_confi
 
     // Stage math assumes 1k minimum; silently clamp to avoid invalid/negative stage counts.
     int stage_max_length = std::max(1024, configured_max_length);
+    if (configured_max_length < 1024) {
+        header_print("FLM", "Warning: benchmark max_length " + std::to_string(configured_max_length) +
+            " is below 1024; using 1024 for stage calculations.");
+    }
 
     xrt::device npu_device_inst = xrt::device(0);
     std::unique_ptr<AutoModel> auto_chat_engine;
