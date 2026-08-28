@@ -204,6 +204,33 @@ static json try_parse_json_value(const std::string& s) {
     }
 }
 
+///@brief Normalize assistant tool_calls so that function.arguments is a JSON object
+/// rather than a serialized JSON string (OpenAI clients send strings). Some chat
+/// templates (e.g. qwen3.5-family XML style) only render <parameter=...> blocks when
+/// arguments is a mapping; a raw string gets re-rendered verbatim, which teaches the
+/// model a malformed tool-call format in multi-turn conversations and leads to blank
+/// parameters in subsequent tool calls.
+static json normalize_tool_call_arguments(json messages) {
+    for (auto& msg : messages) {
+        if (msg.value("role", "") != "assistant" || !msg.contains("tool_calls") ||
+            !msg["tool_calls"].is_array()) {
+            continue;
+        }
+        for (auto& tc : msg["tool_calls"]) {
+            if (tc.contains("function") && tc["function"].is_object()) {
+                auto& fn = tc["function"];
+                if (fn.contains("arguments") && fn["arguments"].is_string()) {
+                    json parsed = try_parse_json_value(fn["arguments"].get<std::string>());
+                    if (parsed.is_object()) {
+                        fn["arguments"] = parsed;
+                    }
+                }
+            }
+        }
+    }
+    return messages;
+}
+
 ///@brief Convert OpenAI-style assistant tool_calls + following tool messages into the
 /// Gemma4 chat-template format, which expects a single assistant message containing
 /// both `tool_calls` and `tool_responses` (with `{name, response}` entries).
@@ -1110,6 +1137,7 @@ void RestHandler::handle_openai_chat_completion(const json& request,
 
         current_messages = normalize_messages(current_messages);
         current_messages = normalize_template(current_messages);
+        current_messages = normalize_tool_call_arguments(current_messages);
 
         // see if we can use prompt cache
         chat_meta_info_t meta_info;
