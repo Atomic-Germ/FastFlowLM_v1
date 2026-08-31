@@ -48,6 +48,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 # ———————————————————————————————————————————————
 option(FLM_USE_HRX "Use the HRX amdxdna NPU runtime instead of XRT (0=XRT default, 1=HRX)" OFF)
 option(FLM_PORTABLE_BUILD "Build portable distribution with bundled runtime libraries" OFF)
+option(FLM_USE_OPEN_EMBEDDING "Use the open CPU embedding engine (open_embedding) for embed-gemma instead of the closed Gemma_Embedding" ON)
 
 if(FLM_USE_HRX)
     set(FLM_RUNTIME_NAME "hrx")
@@ -238,6 +239,10 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/../third_party/tokenizers-cpp
 file(GLOB SOURCES "src/*.cpp" "runner/*.cpp" "common/*.cpp" "common/*/*.cpp" "server/*.cpp" "pull/*.cpp" )
 file(GLOB HEADERS "include/*.hpp" "runner/*.hpp" "common/*.hpp" "common/*/*.hpp" "server/*.hpp" "pull/*.hpp")
 
+if(FLM_USE_OPEN_EMBEDDING)
+    list(APPEND SOURCES "${CMAKE_SOURCE_DIR}/open_embedding/engine.cpp")
+endif()
+
 # Exclude files that depend on missing libraries for Linux
 if(NOT WIN32)
     # list(FILTER SOURCES EXCLUDE REGEX ".*modeling_gemma3\\.cpp$")
@@ -324,6 +329,15 @@ target_include_directories(flm PUBLIC
     ${CMAKE_SOURCE_DIR}/pull
     ${FFMPEG_INCLUDE_DIRS}
 )
+
+if(FLM_USE_OPEN_EMBEDDING)
+    target_include_directories(flm PUBLIC
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/../third_party/tokenizers-cpp/include
+        ${CMAKE_SOURCE_DIR}/../third_party/tokenizers-cpp/msgpack/include
+    )
+    target_compile_definitions(flm PUBLIC FLM_USE_OPEN_EMBEDDING=1)
+endif()
 
 # XRT backend: add the XRT headers (HRX carries its own via the hrx::hrx target).
 if(NOT FLM_USE_HRX)
