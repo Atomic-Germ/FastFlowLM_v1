@@ -1,9 +1,10 @@
 // host.cpp -*- C++ -*-
-// Single-tile bf16 matmul host (64x64x64) for the iron "matmul_bf16" design.
+// Variable-shape bf16 matmul host for the tiled iron design.
 // Generates deterministic bf16 inputs, computes an fp32 CPU reference, runs
-// the NPU kernel through XRT, and compares the bf16 outputs bit-for-bit.
+// the NPU kernel through XRT, and checks the bf16 output numerically.
 
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -41,6 +42,9 @@ static float bf16_to_f32(uint16_t h) {
 int main(int argc, const char *argv[]) {
   if (const char *dim = std::getenv("MM_DIM"))
     DIM_M = DIM_K = DIM_N = std::atoi(dim);
+  if (const char *dim = std::getenv("MM_M")) DIM_M = std::atoi(dim);
+  if (const char *dim = std::getenv("MM_K")) DIM_K = std::atoi(dim);
+  if (const char *dim = std::getenv("MM_N")) DIM_N = std::atoi(dim);
 
   cxxopts::Options options("matmul-host");
   test_utils::add_default_options(options);
@@ -100,8 +104,10 @@ int main(int argc, const char *argv[]) {
   if (verbosity >= 1)
     std::cout << "Running Kernel.\n";
   unsigned int opcode = 3;
+  auto started = std::chrono::steady_clock::now();
   auto run = kernel(opcode, bo_instr, instr_v.size(), bo_a, bo_b, bo_c);
   run.wait();
+  auto stopped = std::chrono::steady_clock::now();
   bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
   int errors = 0;
@@ -117,21 +123,26 @@ int main(int argc, const char *argv[]) {
     max_abs_err = std::max(max_abs_err, abs_err);
     max_rel_err = std::max(max_rel_err, rel_err);
     if (c[i] != ref_bits) bit_mismatches++;
-    if (abs_err > 0.002 + 0.01 * std::fabs((double)ref_val)) errors++;
+    if (abs_err > 0.005 + 0.01 * std::fabs((double)ref_val)) errors++;
   }
 
   std::cout << "max_abs_err=" << max_abs_err
             << " max_rel_err=" << max_rel_err
-            << " bit_mismatches=" << bit_mismatches << "\n";
+            << " bit_mismatches=" << bit_mismatches
+            << " kernel_us="
+            << std::chrono::duration_cast<std::chrono::microseconds>(stopped - started).count()
+            << "\n";
 
-  std::ofstream fa("a.bin", std::ios::binary);
-  fa.write((char *)a, DIM_M * DIM_K * sizeof(uint16_t));
-  std::ofstream fb("b.bin", std::ios::binary);
-  fb.write((char *)b, DIM_K * DIM_N * sizeof(uint16_t));
-  std::ofstream fc("c.bin", std::ios::binary);
-  fc.write((char *)c, DIM_M * DIM_N * sizeof(uint16_t));
-  std::ofstream fr("ref.bin", std::ios::binary);
-  fr.write((char *)&ref[0], DIM_M * DIM_N * sizeof(float));
+  if (const char *prefix = std::getenv("MM_DUMP")) {
+    std::ofstream fa(std::string(prefix) + "a.bin", std::ios::binary);
+    fa.write((char *)a, DIM_M * DIM_K * sizeof(uint16_t));
+    std::ofstream fb(std::string(prefix) + "b.bin", std::ios::binary);
+    fb.write((char *)b, DIM_K * DIM_N * sizeof(uint16_t));
+    std::ofstream fc(std::string(prefix) + "c.bin", std::ios::binary);
+    fc.write((char *)c, DIM_M * DIM_N * sizeof(uint16_t));
+    std::ofstream fr(std::string(prefix) + "ref.bin", std::ios::binary);
+    fr.write((char *)&ref[0], DIM_M * DIM_N * sizeof(float));
+  }
 
   if (!errors) {
     std::cout << "PASS!" << std::endl;

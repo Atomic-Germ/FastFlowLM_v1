@@ -241,6 +241,7 @@ file(GLOB HEADERS "include/*.hpp" "runner/*.hpp" "common/*.hpp" "common/*/*.hpp"
 
 if(FLM_USE_OPEN_EMBEDDING)
     list(APPEND SOURCES "${CMAKE_SOURCE_DIR}/open_embedding/engine.cpp")
+    list(APPEND SOURCES "${CMAKE_SOURCE_DIR}/open_embedding/npu_matmul.cpp")
 endif()
 
 # Exclude files that depend on missing libraries for Linux
@@ -337,6 +338,10 @@ if(FLM_USE_OPEN_EMBEDDING)
         ${CMAKE_SOURCE_DIR}/../third_party/tokenizers-cpp/msgpack/include
     )
     target_compile_definitions(flm PUBLIC FLM_USE_OPEN_EMBEDDING=1)
+    # The open engine's NPU2 BF16 matmul backend needs the XRT backend linked.
+    if(NOT FLM_USE_HRX)
+        target_compile_definitions(flm PUBLIC FLM_USE_OPEN_EMBEDDING_NPU=1)
+    endif()
 endif()
 
 # XRT backend: add the XRT headers (HRX carries its own via the hrx::hrx target).

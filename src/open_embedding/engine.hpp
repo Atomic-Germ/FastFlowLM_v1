@@ -28,6 +28,8 @@
 
 namespace open_embedding {
 
+class NpuMatmul;  // opaque NPU2 BF16 matmul backend (src/open_embedding/npu_matmul.cpp)
+
 enum class task_type_t : uint8_t {
     task_query = 0,
     task_document = 1,
@@ -76,7 +78,13 @@ private:
     std::unordered_map<std::string, std::vector<float>> w_;
     std::unique_ptr<tokenizers::Tokenizer> tok_;
 
+    /// Transposed [K,N] BF16 projection weights for the NPU backend.
+    std::unordered_map<std::string, std::vector<uint16_t>> w_bf16_;
+    /// NPU2 BF16 matmul backend (null when off or unavailable).
+    std::shared_ptr<NpuMatmul> npu_;
+
     bool load_weights();
+    bool load_npu();
     const std::vector<float>& weight(const std::string& name) const;
     std::vector<float> transformer(std::vector<int32_t> ids);
 
@@ -86,6 +94,9 @@ private:
     // y[M,N] = sum_k x[M,K] * w[N,K]   (projection weights, applied transposed)
     static void matmul_t(const std::vector<float>& x, const std::vector<float>& w, size_t M, size_t K, size_t N,
                          std::vector<float>& y);
+    // y[M,N] = sum_k x[M,K] * w[N,K]   (NPU BF16 offload when available)
+    void matmul_t_npu(const std::string& name, const std::vector<float>& x, size_t M, size_t K, size_t N,
+                      std::vector<float>& y);
     // y[M,N] = sum_k x[M,K] * w[K,N]   (row-major)
     static void matmul(const std::vector<float>& x, const std::vector<float>& w, size_t M, size_t K, size_t N,
                        std::vector<float>& y);

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -12,11 +13,46 @@
 #include "nlohmann/json.hpp"
 #include "tokenizers_cpp.h"
 
+#ifdef FLM_USE_OPEN_EMBEDDING_NPU
+#include "npu_utils/npu_utils_matmul.hpp"
+#endif
+
 namespace open_embedding {
 
 using json = nlohmann::json;
 
 static constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+
+// FP32 <-> BF16 helpers (round-to-nearest-even on the way down).
+static uint16_t f32_to_bf16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t lsb = (x >> 16) & 1u;
+    x += 0x7fffu + lsb;
+    return static_cast<uint16_t>(x >> 16);
+}
+
+static float bf16_to_f32(uint16_t h) {
+    float f;
+    uint32_t x = static_cast<uint32_t>(h) << 16;
+    std::memcpy(&f, &x, 4);
+    return f;
+}
+
+// Projection tensors that the NPU backend can serve (2-D, [N,K] fp32).
+static bool is_projection_weight(const std::string& name) {
+    static const char* kSuffixes[] = {
+        "q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
+        "gate_proj.weight", "up_proj.weight", "down_proj.weight",
+        "2_Dense.linear.weight", "3_Dense.linear.weight",
+    };
+    for (const char* s : kSuffixes) {
+        if (name.size() >= std::strlen(s) &&
+            name.compare(name.size() - std::strlen(s), std::strlen(s), s) == 0)
+            return true;
+    }
+    return false;
+}
 
 static const char* kPrompt(task_type_t t) {
     switch (t) {
@@ -62,7 +98,44 @@ bool Engine::load(const std::string& model_dir) {
                      layer_types_.size(), num_layers_);
         return false;
     }
-    return load_weights();
+    if (!load_weights()) return false;
+    load_npu();
+    return true;
+}
+
+bool Engine::load_npu() {
+#ifdef FLM_USE_OPEN_EMBEDDING_NPU
+    const std::string asset_dir =
+        (std::filesystem::path(model_dir_) / "npu_matmul").string();
+    const char* dev_id = std::getenv("FLM_NPU_DEVICE_ID");
+    npu_ = std::make_shared<NpuMatmul>();
+    if (!npu_->init(asset_dir, dev_id ? dev_id : "")) {
+        npu_.reset();
+        std::fprintf(stderr, "open_embedding: running CPU-only\n");
+        return false;
+    }
+    // Precompute transposed [K,N] BF16 projection weights once.
+    for (const auto& [name, wvec] : w_) {
+        if (!is_projection_weight(name)) continue;
+        auto tit = tensors_.find(name);
+        if (tit == tensors_.end() || tit->second.shape.size() != 2) continue;
+        const size_t N = tit->second.shape[0];
+        const size_t K = tit->second.shape[1];
+        if (wvec.size() != N * K) continue;
+        std::vector<uint16_t> bf((size_t)K * N);
+        for (size_t n = 0; n < N; n++) {
+            const float* wr = wvec.data() + n * K;
+            uint16_t* br = bf.data() + n;  // [k,n] -> row k, column n
+            for (size_t k = 0; k < K; k++) br[k * N] = f32_to_bf16(wr[k]);
+        }
+        w_bf16_[name] = std::move(bf);
+    }
+    std::fprintf(stderr, "open_embedding: NPU matmul ready (%zu bf16 weights)\n",
+                 w_bf16_.size());
+#else
+    (void)model_dir_;
+#endif
+    return true;
 }
 
 bool Engine::load_weights() {
@@ -165,6 +238,39 @@ void Engine::matmul_t(const std::vector<float>& x, const std::vector<float>& w, 
     }
 }
 
+void Engine::matmul_t_npu(const std::string& name, const std::vector<float>& x, size_t M, size_t K, size_t N,
+                          std::vector<float>& y) {
+    const std::vector<float>& w = weight(name);
+#ifdef FLM_USE_OPEN_EMBEDDING_NPU
+    if (npu_ && M > 0 && M <= 2048) {
+        const int m_pad = npu_->m_pad_for(static_cast<int>(K), static_cast<int>(N),
+                                          static_cast<int>(M));
+        auto it = w_bf16_.find(name);
+        if (m_pad > 0 && it != w_bf16_.end() &&
+            it->second.size() == static_cast<size_t>(K) * N) {
+            std::vector<uint16_t> a_pad(static_cast<size_t>(m_pad) * K, 0);
+            for (size_t m = 0; m < M; m++) {
+                const float* xr = x.data() + m * K;
+                uint16_t* ar = a_pad.data() + m * K;
+                for (size_t k = 0; k < K; k++) ar[k] = f32_to_bf16(xr[k]);
+            }
+            std::vector<uint16_t> c_pad(static_cast<size_t>(m_pad) * N);
+            if (npu_->matmul_bf16(m_pad, static_cast<int>(K), static_cast<int>(N),
+                                  a_pad.data(), it->second.data(), c_pad.data())) {
+                y.assign(M * N, 0.0f);
+                for (size_t m = 0; m < M; m++) {
+                    const uint16_t* cr = c_pad.data() + m * N;
+                    float* yr = y.data() + m * N;
+                    for (size_t n = 0; n < N; n++) yr[n] = bf16_to_f32(cr[n]);
+                }
+                return;
+            }
+        }
+    }
+#endif
+    matmul_t(x, w, M, K, N, y);
+}
+
 void Engine::matmul(const std::vector<float>& x, const std::vector<float>& w, size_t M, size_t K, size_t N,
                     std::vector<float>& y) {
     // y[M,N] = sum_k x[M,K] * w[K,N]   (row-major)
@@ -242,9 +348,9 @@ std::vector<float> Engine::transformer(std::vector<int32_t> ids) {
 
         // --- projections
         std::vector<float> q, kt, v;
-        matmul_t(x, weight(pfx + "self_attn.q_proj.weight"), T, HD, QD, q);
-        matmul_t(x, weight(pfx + "self_attn.k_proj.weight"), T, HD, ND, kt);
-        matmul_t(x, weight(pfx + "self_attn.v_proj.weight"), T, HD, ND, v);
+        matmul_t_npu(pfx + "self_attn.q_proj.weight", x, T, HD, QD, q);
+        matmul_t_npu(pfx + "self_attn.k_proj.weight", x, T, HD, ND, kt);
+        matmul_t_npu(pfx + "self_attn.v_proj.weight", x, T, HD, ND, v);
 
         // --- q/k norm per head (over head_dim) ---
         std::vector<float> qn(T * QD), kn(T * ND);
@@ -344,18 +450,18 @@ std::vector<float> Engine::transformer(std::vector<int32_t> ids) {
             }
         }
 
-        matmul_t(oatt, weight(pfx + "self_attn.o_proj.weight"), T, QD, HD, o);
+        matmul_t_npu(pfx + "self_attn.o_proj.weight", oatt, T, QD, HD, o);
         rmsnorm(o.data(), weight(pfx + "post_attention_layernorm.weight").data(), T, HD, eps_, x);
         for (size_t i = 0; i < h.size(); i++) h[i] += x[i];
 
         // --- MLP (gate, up) → down ---
         std::vector<float> gate, up;
         rmsnorm(h.data(), weight(pfx + "pre_feedforward_layernorm.weight").data(), T, HD, eps_, x);
-        matmul_t(x, weight(pfx + "mlp.gate_proj.weight"), T, HD, intermediate_, gate);
-        matmul_t(x, weight(pfx + "mlp.up_proj.weight"), T, HD, intermediate_, up);
+        matmul_t_npu(pfx + "mlp.gate_proj.weight", x, T, HD, intermediate_, gate);
+        matmul_t_npu(pfx + "mlp.up_proj.weight", x, T, HD, intermediate_, up);
         gelu_tanh(gate);
         for (size_t i = 0; i < gate.size(); i++) gate[i] *= up[i];
-        matmul_t(gate, weight(pfx + "mlp.down_proj.weight"), T, intermediate_, HD, o);
+        matmul_t_npu(pfx + "mlp.down_proj.weight", gate, T, intermediate_, HD, o);
         rmsnorm(o.data(), weight(pfx + "post_feedforward_layernorm.weight").data(), T, HD, eps_, x);
         for (size_t i = 0; i < h.size(); i++) h[i] += x[i];
         if (track_layers_) track_.push_back(h);
@@ -641,8 +747,8 @@ std::vector<float> Engine::embed_with_prefix(const std::string& text, const std:
     for (size_t i = 0; i < D; i++) pooled[i] /= static_cast<float>(T);
 
     std::vector<float> d1, d2;
-    matmul_t(pooled, weight("2_Dense.linear.weight"), 1, D, head_mid_, d1);
-    matmul_t(d1, weight("3_Dense.linear.weight"), 1, head_mid_, D, d2);
+    matmul_t_npu("2_Dense.linear.weight", pooled, 1, D, head_mid_, d1);
+    matmul_t_npu("3_Dense.linear.weight", d1, 1, head_mid_, D, d2);
     float norm = 0.0f;
     for (size_t i = 0; i < D; i++) norm += d2[i] * d2[i];
     norm = std::sqrt(norm);
