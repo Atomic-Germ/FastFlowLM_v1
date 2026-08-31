@@ -156,8 +156,9 @@ bool NpuMatmul::init(const std::string& asset_dir, const std::string& device_id)
             s.bo_b = std::make_unique<xrt::bo>(
                 *impl_->device_, (size_t)cand.K * cand.N * sizeof(uint16_t),
                 XRT_BO_FLAGS_HOST_ONLY, s.kernel->group_id(4));
+            // Output buffer is now FP32 (bf16_f32 kernel)
             s.bo_c = std::make_unique<xrt::bo>(
-                *impl_->device_, (size_t)s.m_pad * cand.N * sizeof(uint16_t),
+                *impl_->device_, (size_t)s.m_pad * cand.N * sizeof(float),
                 XRT_BO_FLAGS_HOST_ONLY, s.kernel->group_id(5));
 
             std::memcpy(s.bo_instr->map<void*>(), s.insts.data(),
@@ -196,7 +197,7 @@ int NpuMatmul::m_pad_for(int K, int N, int M) const {
 }
 
 bool NpuMatmul::matmul_bf16(int M, int K, int N, const uint16_t* a,
-                            const uint16_t* b, uint16_t* c) {
+                            const uint16_t* b, float* c) {
     if (!impl_->enabled_.load()) return false;
     std::lock_guard<std::mutex> lock(impl_->mu_);
     auto it = impl_->shapes_.find(shape_key(K, N));
@@ -214,12 +215,11 @@ bool NpuMatmul::matmul_bf16(int M, int K, int N, const uint16_t* a,
     try {
         uint16_t* am = s.bo_a->map<uint16_t*>();
         uint16_t* bm = s.bo_b->map<uint16_t*>();
-        uint16_t* cm = s.bo_c->map<uint16_t*>();
+        float* cm = s.bo_c->map<float*>();
         std::memcpy(am, a, (size_t)M * K * sizeof(uint16_t));
         std::memcpy(bm, b, (size_t)K * N * sizeof(uint16_t));
-        // The output BO must be flushed to the device before launch: unwritten
-        // cache lines would otherwise produce nondeterministic partial results.
-        std::memset(cm, 0, (size_t)M * N * sizeof(uint16_t));
+        // Output buffer must be synced to device before launch (zero-padded)
+        std::memset(cm, 0, (size_t)M * N * sizeof(float));
         s.bo_a->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         s.bo_b->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         s.bo_c->sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -229,7 +229,7 @@ bool NpuMatmul::matmul_bf16(int M, int K, int N, const uint16_t* a,
                                *s.bo_b, *s.bo_c);
         run.wait();
         s.bo_c->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        std::memcpy(c, cm, (size_t)M * N * sizeof(uint16_t));
+        std::memcpy(c, cm, (size_t)M * N * sizeof(float));
         return true;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "open_embedding: NPU matmul dispatch failed: %s\n",

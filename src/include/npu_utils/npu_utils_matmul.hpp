@@ -46,9 +46,9 @@ public:
     int m_pad_for(int K, int N, int M) const;
 
     /// Compute C[M,N] = A[M,K] @ B[K,N] for the compiled pad M (=m_pad_for).
-    /// All buffers are row-major BF16 (uint16_t). Returns false on failure.
+    /// All buffers are row-major. A/B are BF16 (uint16_t); C is FP32 (float).
     bool matmul_bf16(int M, int K, int N, const uint16_t* a, const uint16_t* b,
-                     uint16_t* c);
+                     float* c);
 
 private:
     struct Impl;

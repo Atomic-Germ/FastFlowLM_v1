@@ -40,11 +40,12 @@ static float bf16_to_f32(uint16_t h) {
 }
 
 // Projection tensors that the NPU backend can serve (2-D, [N,K] fp32).
-static bool is_projection_weight(const std::string& name) {
+// Only the five large per-layer projections; k/v and contrastive head stay on CPU
+// to preserve numerical fidelity for the final E8 threshold.
+static bool is_npu_projection_weight(const std::string& name) {
     static const char* kSuffixes[] = {
-        "q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
+        "q_proj.weight", "o_proj.weight",
         "gate_proj.weight", "up_proj.weight", "down_proj.weight",
-        "2_Dense.linear.weight", "3_Dense.linear.weight",
     };
     for (const char* s : kSuffixes) {
         if (name.size() >= std::strlen(s) &&
@@ -105,8 +106,9 @@ bool Engine::load(const std::string& model_dir) {
 
 bool Engine::load_npu() {
 #ifdef FLM_USE_OPEN_EMBEDDING_NPU
+    if (std::getenv("FLM_NPU_DISABLE")) return false;
     const std::string asset_dir =
-        (std::filesystem::path(model_dir_) / "npu_matmul").string();
+        (std::filesystem::path(model_dir_) / "npu_matmul_f32").string();
     const char* dev_id = std::getenv("FLM_NPU_DEVICE_ID");
     npu_ = std::make_shared<NpuMatmul>();
     if (!npu_->init(asset_dir, dev_id ? dev_id : "")) {
@@ -116,7 +118,7 @@ bool Engine::load_npu() {
     }
     // Precompute transposed [K,N] BF16 projection weights once.
     for (const auto& [name, wvec] : w_) {
-        if (!is_projection_weight(name)) continue;
+        if (!is_npu_projection_weight(name)) continue;
         auto tit = tensors_.find(name);
         if (tit == tensors_.end() || tit->second.shape.size() != 2) continue;
         const size_t N = tit->second.shape[0];
@@ -254,14 +256,14 @@ void Engine::matmul_t_npu(const std::string& name, const std::vector<float>& x, 
                 uint16_t* ar = a_pad.data() + m * K;
                 for (size_t k = 0; k < K; k++) ar[k] = f32_to_bf16(xr[k]);
             }
-            std::vector<uint16_t> c_pad(static_cast<size_t>(m_pad) * N);
+            std::vector<float> c_pad(static_cast<size_t>(m_pad) * N);
             if (npu_->matmul_bf16(m_pad, static_cast<int>(K), static_cast<int>(N),
                                   a_pad.data(), it->second.data(), c_pad.data())) {
                 y.assign(M * N, 0.0f);
                 for (size_t m = 0; m < M; m++) {
-                    const uint16_t* cr = c_pad.data() + m * N;
+                    const float* cr = c_pad.data() + m * N;
                     float* yr = y.data() + m * N;
-                    for (size_t n = 0; n < N; n++) yr[n] = bf16_to_f32(cr[n]);
+                    for (size_t n = 0; n < N; n++) yr[n] = cr[n];
                 }
                 return;
             }

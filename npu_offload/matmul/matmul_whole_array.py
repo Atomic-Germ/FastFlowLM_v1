@@ -26,6 +26,8 @@ def whole_array_bf16(
     N: CompileTime[int],
     tile_n: CompileTime[int],
     n_aie_cols: CompileTime[int],
+    dtype_in_str: CompileTime[str] = "bf16",
+    dtype_out_str: CompileTime[str] = "bf16",
 ):
     m = k = 64
     n = tile_n
@@ -36,12 +38,15 @@ def whole_array_bf16(
     assert K % k == 0
     assert N % (n * n_aie_cols) == 0
 
+    dtype_in = iron.str_to_dtype(dtype_in_str)
+    dtype_out = iron.str_to_dtype(dtype_out_str)
+
     matmul_kernel = kernels.mm(
         dim_m=m,
         dim_k=k,
         dim_n=n,
-        input_dtype=iron.str_to_dtype("bf16"),
-        output_dtype=iron.str_to_dtype("bf16"),
+        input_dtype=dtype_in,
+        output_dtype=dtype_out,
         vectorized=True,
     )
     zero_kernel = matmul_kernel.zero
@@ -52,16 +57,15 @@ def whole_array_bf16(
     n_shim_mem_a = min(n_aie_cols, n_aie_rows)
     n_a_tiles_per_shim = n_aie_rows // n_aie_cols if n_aie_cols < 4 else 1
 
-    dtype = iron.str_to_dtype("bf16")
-    A_ty = np.ndarray[(M * K,), np.dtype[dtype]]
-    B_ty = np.ndarray[(K * N,), np.dtype[dtype]]
-    C_ty = np.ndarray[(M * N,), np.dtype[dtype]]
-    A_l2_ty = np.ndarray[(m * k * n_a_tiles_per_shim,), np.dtype[dtype]]
-    B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype]]
-    C_l2_ty = np.ndarray[(m * n * n_aie_rows,), np.dtype[dtype]]
-    A_l1_ty = np.ndarray[(m, k), np.dtype[dtype]]
-    B_l1_ty = np.ndarray[(k, n), np.dtype[dtype]]
-    C_l1_ty = np.ndarray[(m, n), np.dtype[dtype]]
+    A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
+    B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
+    C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
+    A_l2_ty = np.ndarray[(m * k * n_a_tiles_per_shim,), np.dtype[dtype_in]]
+    B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
+    C_l2_ty = np.ndarray[(m * n * n_aie_rows,), np.dtype[dtype_out]]
+    A_l1_ty = np.ndarray[(m, k), np.dtype[dtype_in]]
+    B_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
+    C_l1_ty = np.ndarray[(m, n), np.dtype[dtype_out]]
 
     A_l3l2 = [None] * n_shim_mem_a
     A_l2l1 = [None] * n_aie_rows
@@ -222,6 +226,8 @@ def _compile_kwargs(opts):
         N=opts.N,
         tile_n=opts.tile_n,
         n_aie_cols=opts.n_aie_cols,
+        dtype_in_str=opts.dtype_in,
+        dtype_out_str=opts.dtype_out,
     )
 
 
@@ -244,6 +250,8 @@ def main():
     parser.add_argument("-N", type=int, default=768)
     parser.add_argument("--tile-n", type=int, default=32)
     parser.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=4)
+    parser.add_argument("--dtype-in", type=str, choices=["bf16", "i16", "i8"], default="bf16", dest="dtype_in")
+    parser.add_argument("--dtype-out", type=str, choices=["bf16", "f32", "i32", "i16", "i8"], default="bf16", dest="dtype_out")
     opts = parser.parse_args()
     run_design_cli(
         whole_array_bf16,
