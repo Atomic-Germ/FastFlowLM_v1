@@ -898,3 +898,52 @@ install(FILES model_info.json DESTINATION "${FLM_SHARE_DESTINATION}")
 # xclbins, which are loaded by shared libraries need to be in location
 # relative to the executable, so we install them relative to the binary.
 install(DIRECTORY xclbins DESTINATION "${FLM_SHARE_DESTINATION}")
+
+# ————————————————————————————————————————————————————
+# Python utilities: install flm-model wrapper + set up venv
+# ————————————————————————————————————————————————————
+if(NOT WIN32)
+    find_program(PYTHON3_EXECUTABLE python3)
+
+    if(PYTHON3_EXECUTABLE)
+        # Install the unified model CLI wrapper
+        install(PROGRAMS flm_model.py
+                DESTINATION "${FLM_BIN_DESTINATION}"
+                RENAME flm-model)
+
+        # Create a venv and install the three Python packages into it.
+        # Guarded with WARNING so the C++ build never fails if Python is missing.
+        install(CODE "
+            set(_venv_dir \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/.venv\")
+            message(STATUS \"Creating Python venv at \${_venv_dir}...\")
+            execute_process(
+                COMMAND \"${PYTHON3_EXECUTABLE}\" -m venv \"\${_venv_dir}\"
+                RESULT_VARIABLE _venv_rc)
+            if(NOT _venv_rc EQUAL 0)
+                message(WARNING \"Failed to create venv; Python utilities will not be installed\")
+                return()
+            endif()
+
+            # Prefer uv if available, fall back to pip
+            find_program(_uv_executable uv)
+            if(_uv_executable)
+                set(_pip_cmd \"\${_uv_executable}\" pip install --python \"\${_venv_dir}/bin/python\")
+            else()
+                set(_pip_cmd \"\${_venv_dir}/bin/pip\" install)
+            endif()
+
+            message(STATUS \"Installing Python utilities (flm-add, flm-test, q4nx-build)...\")
+            execute_process(
+                COMMAND \${_pip_cmd}
+                    \"${CMAKE_SOURCE_DIR}/../utilities/flm-add\"
+                    \"${CMAKE_SOURCE_DIR}/../utilities/flm-test\"
+                    \"${CMAKE_SOURCE_DIR}/../utilities/q4nx-build\"
+                RESULT_VARIABLE _pip_rc)
+            if(NOT _pip_rc EQUAL 0)
+                message(WARNING \"pip/uv install of Python utilities failed\")
+            endif()
+        ")
+    else()
+        message(STATUS "python3 not found; Python utilities will not be installed")
+    endif()
+endif()

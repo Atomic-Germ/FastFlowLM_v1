@@ -63,6 +63,29 @@ fi
 echo "[home_install] installing to $FLM_PREFIX ..."
 cmake --install "$BUILD_DIR" --prefix "$FLM_PREFIX"
 
+# ---- install Python utilities into a venv under the prefix ----------------
+VENV_DIR="$FLM_PREFIX/.venv"
+echo "[home_install] creating Python venv at $VENV_DIR ..."
+if command -v uv >/dev/null 2>&1; then
+    echo "[home_install] using uv"
+    uv venv "$VENV_DIR"
+    uv pip install --python "$VENV_DIR/bin/python" \
+        "$REPO_DIR/utilities/flm-add" \
+        "$REPO_DIR/utilities/flm-test" \
+        "$REPO_DIR/utilities/q4nx-build"
+else
+    echo "[home_install] uv not found, falling back to pip"
+    python3 -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/pip" install \
+        "$REPO_DIR/utilities/flm-add" \
+        "$REPO_DIR/utilities/flm-test" \
+        "$REPO_DIR/utilities/q4nx-build"
+fi
+
+# Install the unified model CLI wrapper
+echo "[home_install] installing flm-model wrapper"
+install -m 755 "$SRC_DIR/flm_model.py" "$FLM_PREFIX/bin/flm-model"
+
 # ---- emit the environment script ------------------------------------------
 ENV_SCRIPT="$FLM_PREFIX/flm_env.sh"
 echo "[home_install] writing env script: $ENV_SCRIPT"
@@ -76,6 +99,11 @@ cat > "$ENV_SCRIPT" <<EOF
 
 FLM_PREFIX="$FLM_PREFIX"
 XRT_DIR="$XRT_DIR"
+
+# 0. Activate Python venv for model tools (flm-model, flm-add, flm-test, q4nx-build).
+if [[ -f "\$FLM_PREFIX/.venv/bin/activate" ]]; then
+    source "\$FLM_PREFIX/.venv/bin/activate"
+fi
 
 # 1. Data files (consumed by utils::find_model_list / utils::find_xclbin_path).
 export FLM_CONFIG_PATH="\$FLM_PREFIX/share/flm/model_list.json"
@@ -96,7 +124,9 @@ export LD_LIBRARY_PATH="\$FLM_PREFIX/lib/flm:\${LD_LIBRARY_PATH:-}"
 
 # 3. Put flm on PATH.
 export PATH="\$FLM_PREFIX/bin:\$PATH"
-export FLM_MODEL_PATH="/scratch/alfxu"
+
+# 4. Model storage root (where user models are installed).
+export FLM_MODEL_PATH="\${FLM_MODEL_PATH:-\$HOME/.config/flm}"
 
 echo "[flm_env] FastFlowLM environment ready (prefix: \$FLM_PREFIX)"
 EOF
@@ -106,3 +136,4 @@ echo
 echo "[home_install] Done."
 echo "  Run:    source \"$ENV_SCRIPT\" && flm --help"
 echo "  Or:     source \"$ENV_SCRIPT\" && flm run <model>"
+echo "  Models: source \"$ENV_SCRIPT\" && flm-model list"

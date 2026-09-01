@@ -3,7 +3,7 @@ OUT_DIR   := out
 PWSH      := powershell.exe
 
 
-.PHONY: all clean run serve install
+.PHONY: all clean run serve install model-build model-install model-test model-list model-venv
 
 ifeq ($(OS),Windows_NT)
 
@@ -63,3 +63,39 @@ install:
 	@cd $(BUILD_DIR) && sudo cmake --install . 
 
 endif
+
+# ---------------------------------------------------------------------------
+# Model management targets — shared across platforms
+# ---------------------------------------------------------------------------
+
+MODEL_PY ?= python3
+FLM_MODEL_ARGS ?=
+
+model-venv:
+	@if command -v uv >/dev/null 2>&1; then \
+		echo "[model-venv] using uv"; \
+		uv venv .venv; \
+		uv pip install --python .venv/bin/python \
+			../utilities/flm-add \
+			../utilities/flm-test \
+			../utilities/q4nx-build; \
+	else \
+		echo "[model-venv] uv not found, using pip"; \
+		$(MODEL_PY) -m venv .venv; \
+		.venv/bin/pip install \
+			../utilities/flm-add \
+			../utilities/flm-test \
+			../utilities/q4nx-build; \
+	fi
+
+model-build:
+	$(MODEL_PY) flm_model.py build $(FLM_MODEL_ARGS)
+
+model-install:
+	$(MODEL_PY) flm_model.py install $(FLM_MODEL_ARGS)
+
+model-test:
+	$(MODEL_PY) flm_model.py test $(FLM_MODEL_ARGS)
+
+model-list:
+	$(MODEL_PY) flm_model.py list

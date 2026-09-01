@@ -41,5 +41,10 @@ if [ "$FLM_RUNTIME" = "xrt" ]; then
     fi
 fi
 
+# Activate Python venv if present in the portable tree.
+if [ -f "$SCRIPT_DIR/.venv/bin/activate" ]; then
+    source "$SCRIPT_DIR/.venv/bin/activate"
+fi
+
 # Execute the real binary, forwarding all arguments.
 exec "$SCRIPT_DIR/flm-real" "$@"
